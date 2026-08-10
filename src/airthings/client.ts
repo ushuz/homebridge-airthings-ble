@@ -68,6 +68,12 @@ import {
   isAtomDevice,
   productName,
 } from "./deviceType.js"
+import {
+  formatVersion,
+  needsFirmwareUpgrade,
+  parseFirmwareVersion,
+  requiredFirmwareForModel,
+} from "./firmware.js"
 import { getRadonLevel } from "./radonLevel.js"
 import { getSensorDecoder } from "./sensorDecoders.js"
 import { AirthingsDevice, emptyDevice } from "./types.js"
@@ -87,26 +93,15 @@ const SENSOR_CHAR_UUIDS = new Set([
   COMMAND_UUID_WAVE_MINI,
 ].map((u) => u.replace(/-/g, "").toLowerCase()))
 
+/** settle window after last atom notify packet before treating payload as complete */
+const ATOM_NOTIFY_SETTLE_MS = 150
+
 function uuidKey(uuid: string): string {
   return uuid.replace(/-/g, "").toLowerCase()
 }
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
-}
-
-async function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
-  let timer: NodeJS.Timeout | undefined
-  try {
-    return await Promise.race([
-      promise,
-      new Promise<T>((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)
-      }),
-    ])
-  } finally {
-    if (timer) clearTimeout(timer)
-  }
 }
 
 async function readChar(char: Characteristic): Promise<Buffer> {
@@ -196,6 +191,8 @@ export class AirthingsClient {
   private readonly logger: LoggerLike
   private readonly isMetric: boolean
   private readonly maxAttempts: number
+  /** generation counter so timed-out attempts ignore late results */
+  private updateGeneration = 0
 
   constructor(options: ClientOptions) {
     this.logger = options.logger
@@ -211,24 +208,85 @@ export class AirthingsClient {
 
     let lastError: unknown
     for (let attempt = 0; attempt < this.maxAttempts; attempt++) {
+      const generation = ++this.updateGeneration
       try {
-        return await withTimeout(this.updateOnce(peripheral), UPDATE_TIMEOUT_MS, "device update")
+        return await this.updateOnceWithTimeout(peripheral, generation)
       } catch (err) {
         lastError = err
         this.logger.debug(`Update attempt ${attempt + 1} failed: ${String(err)}`)
+        // force disconnect and wait so the timed-out attempt finishes cleanup
+        // before the next connect (single hci adapter on pi zero w)
         await disconnectPeripheral(peripheral)
+        await sleep(300)
         if (attempt < this.maxAttempts - 1) {
-          await sleep(500)
+          await sleep(200)
         }
       }
     }
     throw lastError instanceof Error ? lastError : new Error(String(lastError))
   }
 
-  private async updateOnce(peripheral: Peripheral): Promise<AirthingsDevice> {
+  /**
+   * run updateOnce with a wall-clock timeout.
+   * on timeout, bump generation (invalidate late work), disconnect, then reject
+   * only after disconnect so retries do not race the previous gatt session.
+   */
+  private async updateOnceWithTimeout(
+    peripheral: Peripheral,
+    generation: number,
+  ): Promise<AirthingsDevice> {
+    let timer: NodeJS.Timeout | undefined
+    let timedOut = false
+
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        timedOut = true
+        // invalidate this attempt so late results are dropped
+        if (this.updateGeneration === generation) {
+          this.updateGeneration++
+        }
+        reject(new Error(`device update timed out after ${UPDATE_TIMEOUT_MS}ms`))
+      }, UPDATE_TIMEOUT_MS)
+    })
+
+    const work = this.updateOnce(peripheral, generation)
+      .then(async (result) => {
+        if (timedOut || this.updateGeneration !== generation) {
+          // stale attempt: ensure disconnected and discard result
+          await disconnectPeripheral(peripheral)
+          throw new Error("stale device update attempt")
+        }
+        return result
+      })
+      .catch(async (err) => {
+        if (timedOut || this.updateGeneration !== generation) {
+          await disconnectPeripheral(peripheral)
+        }
+        throw err
+      })
+
+    try {
+      return await Promise.race([work, timeoutPromise])
+    } finally {
+      if (timer) clearTimeout(timer)
+      if (timedOut) {
+        await disconnectPeripheral(peripheral)
+        // give bluez a beat to release the handle before retry
+        await sleep(200)
+      }
+    }
+  }
+
+  private async updateOnce(
+    peripheral: Peripheral,
+    generation: number,
+  ): Promise<AirthingsDevice> {
+    this.assertGeneration(generation)
     await connectPeripheral(peripheral)
+    this.assertGeneration(generation)
     try {
       const { characteristics } = await peripheral.discoverAllServicesAndCharacteristicsAsync()
+      this.assertGeneration(generation)
       const byUuid = new Map<string, Characteristic>()
       for (const char of characteristics) {
         byUuid.set(uuidKey(char.uuid), char)
@@ -239,16 +297,19 @@ export class AirthingsClient {
       })
 
       await this.readDeviceInfo(byUuid, device)
+      this.assertGeneration(generation)
       if (device.model === AirthingsDeviceType.UNKNOWN) {
         throw new UnsupportedDeviceError("Model is not supported")
       }
 
       if (isAtomDevice(device.model)) {
-        await this.readAtomSensors(byUuid, device)
+        this.warnIfFirmwareOutdated(device)
+        await this.readAtomSensors(byUuid, device, generation)
       } else {
-        await this.readWaveSensors(byUuid, device)
+        await this.readWaveSensors(byUuid, device, generation)
       }
 
+      this.assertGeneration(generation)
       device.lastUpdateAt = Date.now()
       if (!device.name) {
         device.name = `Airthings ${productName(device.model)}`
@@ -256,6 +317,27 @@ export class AirthingsClient {
       return device
     } finally {
       await disconnectPeripheral(peripheral)
+    }
+  }
+
+  private assertGeneration(generation: number): void {
+    if (this.updateGeneration !== generation) {
+      throw new Error("stale device update attempt")
+    }
+  }
+
+  private warnIfFirmwareOutdated(device: AirthingsDevice): void {
+    const required = requiredFirmwareForModel(device.model)
+    if (!required) {
+      return
+    }
+    if (needsFirmwareUpgrade(device.swVersion, required)) {
+      const current = parseFirmwareVersion(device.swVersion)
+      this.logger.warn(
+        `Firmware for ${device.address} is not up to date`
+        + ` (current ${current ? formatVersion(current) : device.swVersion || "unknown"},`
+        + ` need ${required} or newer). Update via the Airthings app.`,
+      )
     }
   }
 
@@ -315,10 +397,12 @@ export class AirthingsClient {
   private async readWaveSensors(
     byUuid: Map<string, Characteristic>,
     device: AirthingsDevice,
+    generation: number,
   ): Promise<void> {
     const sensors: SensorMap = { ...device.sensors }
 
     for (const [key, char] of byUuid) {
+      this.assertGeneration(generation)
       if (!SENSOR_CHAR_UUIDS.has(key)) {
         continue
       }
@@ -357,9 +441,8 @@ export class AirthingsClient {
 
   private async runCommand(
     char: Characteristic,
-    decoder: ReturnType<typeof getCommandDecoder> & object,
+    decoder: NonNullable<ReturnType<typeof getCommandDecoder>>,
   ): Promise<SensorMap | null> {
-    if (!decoder) return null
     const receiver = decoder.makeDataReceiver()
     const onData = (data: Buffer) => receiver.asCallback(data)
 
@@ -386,6 +469,7 @@ export class AirthingsClient {
   private async readAtomSensors(
     byUuid: Map<string, Characteristic>,
     device: AirthingsDevice,
+    generation: number,
   ): Promise<void> {
     const writeCharRef = byUuid.get(uuidKey(COMMAND_UUID_ATOM))
     const notifyCharRef = byUuid.get(uuidKey(COMMAND_UUID_ATOM_NOTIFY))
@@ -395,11 +479,13 @@ export class AirthingsClient {
 
     const sensors: SensorMap = { ...device.sensors }
 
+    this.assertGeneration(generation)
     const connectivity = await this.fetchAtom(writeCharRef, notifyCharRef, AtomRequestPath.CONNECTIVITY_MODE)
     if (connectivity) {
       Object.assign(sensors, connectivity)
     }
 
+    this.assertGeneration(generation)
     const latest = await this.fetchAtom(writeCharRef, notifyCharRef, AtomRequestPath.LATEST_VALUES)
     if (latest) {
       this.parseAtomSensorData(device.model, sensors, latest)
@@ -408,20 +494,28 @@ export class AirthingsClient {
     device.sensors = sensors
   }
 
+  /**
+   * collect atom notify payload until silence after the header arrives,
+   * or total timeout. more reliable than a single 100ms settle for multi-packet cbor.
+   */
   private async fetchAtom(
     writeCharRef: Characteristic,
     notifyCharRef: Characteristic,
     path: AtomRequestPath,
   ): Promise<SensorMap | null> {
     const decoder = new AtomCommandDecode(path)
-    const receiver = decoder.makeDataReceiver()
-    // atom responses fit in one notify packet; wait for first packet (size 0 => any data)
-    // bump expected size so we wait until first packet arrives, then settle briefly for multi-packet
+    // object holder so closure mutations stay visible to the control flow
+    const state: { message: Buffer | null, lastPacketAt: number } = {
+      message: null,
+      lastPacketAt: 0,
+    }
+
     const onData = (data: Buffer) => {
-      if (receiver.message === null) {
-        receiver.message = Buffer.from(data)
+      state.lastPacketAt = Date.now()
+      if (state.message === null) {
+        state.message = Buffer.from(data)
       } else {
-        receiver.message = Buffer.concat([receiver.message, data])
+        state.message = Buffer.concat([state.message, data])
       }
     }
 
@@ -429,20 +523,23 @@ export class AirthingsClient {
     try {
       await subscribe(notifyCharRef)
       await writeChar(writeCharRef, decoder.cmd, false)
-      // wait until we have a response header, then a short settle for multi-packet
+
       const deadline = Date.now() + COMMAND_TIMEOUT_MS
       while (Date.now() < deadline) {
-        if (receiver.message && receiver.message.length >= 9) {
-          await sleep(100)
-          break
+        if (state.message && state.message.length >= 9) {
+          // wait until no new packets for settle window
+          if (Date.now() - state.lastPacketAt >= ATOM_NOTIFY_SETTLE_MS) {
+            break
+          }
         }
-        await sleep(50)
+        await sleep(40)
       }
-      if (!receiver.message) {
+
+      if (!state.message) {
         this.logger.warn("Timeout getting atom command data.")
         return null
       }
-      return decoder.decodeData(this.logger, receiver.message)
+      return decoder.decodeData(this.logger, state.message)
     } finally {
       notifyCharRef.removeListener("data", onData)
       try {
@@ -483,6 +580,13 @@ export class AirthingsClient {
     this.mapAtomRadon(next, month, RADON_MONTH_AVG, RADON_MONTH_LEVEL)
     this.mapAtomRadon(next, sensorData[ATOM_RADON_YEAR_AVG], RADON_YEAR_AVG, RADON_YEAR_LEVEL)
 
+    // homekit exposes a single long-term average; prefer year, else month, else week
+    const longTermRaw =
+      sensorData[ATOM_RADON_YEAR_AVG]
+      ?? month
+      ?? sensorData[ATOM_RADON_WEEK_AVG]
+    this.mapAtomRadon(next, longTermRaw, RADON_LONGTERM_AVG, RADON_LONGTERM_LEVEL)
+
     this.logger.debug(`Atom sensor values: ${JSON.stringify(next)}`)
     Object.assign(sensors, next)
   }
@@ -496,12 +600,14 @@ export class AirthingsClient {
     if (raw === undefined || raw === null) {
       return
     }
+    // level always derived from bq/m³ before optional pCi conversion
     const bq = Number(raw)
     target[avgKey] = this.isMetric ? bq : bq * BQ_TO_PCI_MULTIPLIER
     target[levelKey] = getRadonLevel(bq)
   }
 
   private applyRadonUnits(sensors: SensorMap, sensorData: SensorMap): void {
+    // level always derived from bq/m³ before optional pCi conversion
     if (sensorData[RADON_1DAY_AVG] !== undefined && sensorData[RADON_1DAY_AVG] !== null) {
       const bq = Number(sensorData[RADON_1DAY_AVG])
       sensors[RADON_1DAY_LEVEL] = getRadonLevel(bq)

@@ -1,6 +1,6 @@
 import noble, { type Peripheral } from "@abandonware/noble"
 import type { Logging } from "homebridge"
-import { MFCT_ID } from "../airthings/const.js"
+import { MFCT_ID, SERVICE_UUIDS } from "../airthings/const.js"
 import { AirthingsClient, UnsupportedDeviceError } from "../airthings/client.js"
 import type { AirthingsDevice } from "../airthings/types.js"
 import { productName } from "../airthings/deviceType.js"
@@ -27,8 +27,19 @@ export interface DiscoveredDevice {
   peripheral: Peripheral
 }
 
+const POWERED_ON_TIMEOUT_MS = 60_000
+const SHUTDOWN_QUEUE_TIMEOUT_MS = 10_000
+
+const SERVICE_UUID_KEYS = new Set(
+  SERVICE_UUIDS.map((u) => u.replace(/-/g, "").toLowerCase()),
+)
+
 function normalizeAddress(address: string): string {
   return address.toLowerCase().replace(/-/g, "").replace(/:/g, "")
+}
+
+function normalizeServiceUuid(uuid: string): string {
+  return uuid.replace(/-/g, "").toLowerCase()
 }
 
 /**
@@ -48,7 +59,6 @@ export function parseSerial(manufacturerData?: Buffer): string | null {
       }
     }
     // without company id (some noble backends)
-    // if first two bytes look like company id elsewhere, skip
     const maybeCompany = manufacturerData.readUInt16LE(0)
     if (maybeCompany === MFCT_ID && manufacturerData.length >= 6) {
       return String(manufacturerData.readUInt32LE(2))
@@ -61,6 +71,11 @@ export function parseSerial(manufacturerData?: Buffer): string | null {
     return null
   }
   return null
+}
+
+function hasAirthingsServiceUuid(peripheral: Peripheral): boolean {
+  const uuids = peripheral.advertisement?.serviceUuids ?? []
+  return uuids.some((u) => SERVICE_UUID_KEYS.has(normalizeServiceUuid(u)))
 }
 
 function sleep(ms: number): Promise<void> {
@@ -77,12 +92,16 @@ export class BleScanner {
   private readonly client: AirthingsClient
   private readonly peripherals = new Map<string, Peripheral>()
   private readonly devices = new Map<string, DiscoveredDevice>()
+  /** peripherals seen by address before serial is known (service-uuid path) */
+  private readonly pendingByAddress = new Map<string, Peripheral>()
   readonly lastData = new Map<string, AirthingsDevice>()
   private queue: Promise<void> = Promise.resolve()
   private refreshTimer: NodeJS.Timeout | null = null
   private stopped = false
+  private polling = false
   private state = "unknown"
   private onUpdate?: (id: string, device: AirthingsDevice) => void
+  private onDiscovered?: (device: DiscoveredDevice) => void
 
   constructor(log: Logging, config: ScannerConfig) {
     this.log = log
@@ -105,6 +124,11 @@ export class BleScanner {
     this.onUpdate = handler
   }
 
+  /** called when a new device is found during a later re-scan */
+  setDiscoveredHandler(handler: (device: DiscoveredDevice) => void): void {
+    this.onDiscovered = handler
+  }
+
   async init(): Promise<void> {
     await this.waitForPoweredOn()
     this.log.info("Bluetooth adapter ready")
@@ -116,28 +140,54 @@ export class BleScanner {
       return Promise.resolve()
     }
     return new Promise((resolve, reject) => {
+      let settled = false
+      const cleanup = () => {
+        noble.removeListener("stateChange", onChange)
+        clearTimeout(timer)
+      }
       const onChange = (state: string) => {
         this.state = state
         this.log.debug(`Bluetooth state: ${state}`)
+        if (settled) return
         if (state === "poweredOn") {
-          noble.removeListener("stateChange", onChange)
+          settled = true
+          cleanup()
           resolve()
         } else if (state === "unsupported" || state === "unauthorized") {
-          noble.removeListener("stateChange", onChange)
+          settled = true
+          cleanup()
           reject(new Error(`Bluetooth adapter state: ${state}`))
         }
       }
+      const timer = setTimeout(() => {
+        if (settled) return
+        settled = true
+        cleanup()
+        reject(
+          new Error(
+            `Bluetooth adapter did not become poweredOn within ${POWERED_ON_TIMEOUT_MS / 1000}s`
+            + ` (last state: ${this.state || noble.state}).`
+            + " Enable the adapter, join the bluetooth group, and check setcap on node.",
+          ),
+        )
+      }, POWERED_ON_TIMEOUT_MS)
+
       noble.on("stateChange", onChange)
-      // handle already-set state races
       if (noble.state === "poweredOn") {
         onChange(noble.state)
+      } else {
+        this.state = noble.state
       }
     })
   }
 
-  async discover(): Promise<DiscoveredDevice[]> {
-    this.devices.clear()
-    this.peripherals.clear()
+  async discover(options?: { clear?: boolean }): Promise<DiscoveredDevice[]> {
+    const clear = options?.clear ?? true
+    if (clear) {
+      this.devices.clear()
+      this.peripherals.clear()
+      this.pendingByAddress.clear()
+    }
 
     const onDiscover = (peripheral: Peripheral) => {
       this.handleDiscover(peripheral)
@@ -146,6 +196,8 @@ export class BleScanner {
     noble.on("discover", onDiscover)
     try {
       this.log.info(`Scanning for Airthings devices (${this.config.scanDurationSec}s)...`)
+      // empty service list + allow duplicates; we filter in handleDiscover
+      // (service uuid filter is applied in software so manufacturer-only ads still match)
       await noble.startScanningAsync([], true)
       await sleep(this.config.scanDurationSec * 1000)
       await noble.stopScanningAsync()
@@ -153,13 +205,13 @@ export class BleScanner {
       noble.removeListener("discover", onDiscover)
     }
 
-    // also include configured addresses not seen in scan (direct connect later)
     for (const filter of this.config.devices) {
       if (filter.address) {
         const key = normalizeAddress(filter.address)
         if (![...this.devices.values()].some((d) => normalizeAddress(d.address) === key)) {
           this.log.warn(
-            `Configured address ${filter.address} not seen during scan; it will be skipped until advertised`,
+            `Configured address ${filter.address} not seen during scan;`
+            + " will retry on later re-scans.",
           )
         }
       }
@@ -174,20 +226,51 @@ export class BleScanner {
   }
 
   private handleDiscover(peripheral: Peripheral): void {
-    const serial = parseSerial(peripheral.advertisement?.manufacturerData)
-    if (!serial) {
+    const serialFromMfg = parseSerial(peripheral.advertisement?.manufacturerData)
+    const serviceMatch = hasAirthingsServiceUuid(peripheral)
+
+    if (!serialFromMfg && !serviceMatch) {
       return
     }
 
-    if (!this.matchesFilter(serial, peripheral)) {
+    // manufacturer path: full id immediately
+    if (serialFromMfg) {
+      if (!this.matchesFilter(serialFromMfg, peripheral)) {
+        return
+      }
+      this.registerDevice(serialFromMfg, peripheral)
       return
     }
 
+    // service-uuid only: stash by address; serial resolved on connect during poll
+    if (serviceMatch) {
+      const address = peripheral.address || peripheral.id
+      if (!this.matchesFilterByAddress(peripheral) && this.config.devices.length > 0) {
+        // allow if any filter is address-only matching, or no serial filters constrain us
+        const addressFilters = this.config.devices.filter((d) => d.address)
+        const serialOnly = this.config.devices.every((d) => d.serialNumber && !d.address)
+        if (serialOnly) {
+          // cannot match serial yet; keep pending and resolve later
+        } else if (addressFilters.length > 0 && !this.matchesFilterByAddress(peripheral)) {
+          return
+        }
+      }
+      this.pendingByAddress.set(normalizeAddress(address), peripheral)
+      this.log.debug(
+        `Pending Airthings candidate by service uuid: ${address} (serial unknown until connect)`,
+      )
+    }
+  }
+
+  private registerDevice(serial: string, peripheral: Peripheral): DiscoveredDevice {
     const address = peripheral.address || peripheral.id
     const id = serial
+    const isNew = !this.devices.has(id)
     const localName = peripheral.advertisement?.localName
     const configuredName = this.config.devices.find(
-      (d) => d.serialNumber === serial || (d.address && normalizeAddress(d.address) === normalizeAddress(address)),
+      (d) =>
+        d.serialNumber === serial
+        || (d.address && normalizeAddress(d.address) === normalizeAddress(address)),
     )?.name
 
     const device: DiscoveredDevice = {
@@ -200,6 +283,12 @@ export class BleScanner {
 
     this.devices.set(id, device)
     this.peripherals.set(id, peripheral)
+    this.pendingByAddress.delete(normalizeAddress(address))
+
+    if (isNew) {
+      this.onDiscovered?.(device)
+    }
+    return device
   }
 
   private matchesFilter(serial: string, peripheral: Peripheral): boolean {
@@ -214,37 +303,129 @@ export class BleScanner {
     })
   }
 
+  private matchesFilterByAddress(peripheral: Peripheral): boolean {
+    if (this.config.devices.length === 0) {
+      return true
+    }
+    const address = normalizeAddress(peripheral.address || peripheral.id)
+    return this.config.devices.some(
+      (d) => d.address && normalizeAddress(d.address) === address,
+    )
+  }
+
   startPolling(): void {
     this.stopped = false
-    void this.pollAll()
+    void this.pollCycle()
     this.refreshTimer = setInterval(() => {
-      void this.pollAll()
+      void this.pollCycle()
     }, this.config.refreshIntervalSec * 1000)
-    // unref so homebridge can exit cleanly in tests
     this.refreshTimer.unref?.()
   }
 
-  stop(): void {
+  /** single-flight poll: interval ticks no-op while a cycle is running */
+  private async pollCycle(): Promise<void> {
+    if (this.stopped || this.polling) {
+      if (this.polling) {
+        this.log.debug("Skipping poll cycle; previous cycle still running")
+      }
+      return
+    }
+    this.polling = true
+    try {
+      // re-scan so devices that were offline at startup can appear
+      try {
+        await this.enqueue(() => this.discover({ clear: false }))
+      } catch (err) {
+        this.log.warn(`Re-scan failed: ${String(err)}`)
+      }
+
+      // try pending service-uuid candidates (serial resolved on connect)
+      for (const [addr, peripheral] of [...this.pendingByAddress.entries()]) {
+        if (this.stopped) return
+        try {
+          await this.enqueue(() => this.resolvePending(addr, peripheral))
+        } catch (err) {
+          this.log.debug(`Failed resolving pending ${addr}: ${String(err)}`)
+        }
+      }
+
+      for (const device of this.devices.values()) {
+        if (this.stopped) return
+        try {
+          await this.enqueue(() => this.pollDevice(device))
+        } catch (err) {
+          this.log.error(`Failed to poll ${device.displayName}: ${String(err)}`)
+        }
+      }
+    } finally {
+      this.polling = false
+    }
+  }
+
+  private async resolvePending(addr: string, peripheral: Peripheral): Promise<void> {
+    this.log.debug(`Connecting to resolve serial for ${addr}...`)
+    try {
+      if (peripheral.state === "connected") {
+        await peripheral.disconnectAsync()
+      }
+      const data = await this.client.updateDevice(peripheral)
+      const serial = data.identifier
+      if (!serial) {
+        this.log.warn(`Could not resolve serial for ${addr}; dropping candidate`)
+        this.pendingByAddress.delete(addr)
+        return
+      }
+      if (!this.matchesFilter(serial, peripheral)) {
+        this.log.debug(`Resolved ${serial} at ${addr} but filtered out by config`)
+        this.pendingByAddress.delete(addr)
+        return
+      }
+      const device = this.registerDevice(serial, peripheral)
+      this.lastData.set(device.id, data)
+      this.onUpdate?.(device.id, data)
+    } catch (err) {
+      if (err instanceof UnsupportedDeviceError) {
+        this.log.warn(`Unsupported pending device ${addr}: ${err.message}`)
+        this.pendingByAddress.delete(addr)
+        return
+      }
+      throw err
+    }
+  }
+
+  async stop(): Promise<void> {
     this.stopped = true
     if (this.refreshTimer) {
       clearInterval(this.refreshTimer)
       this.refreshTimer = null
     }
     try {
-      noble.stopScanning()
+      await noble.stopScanningAsync()
+    } catch {
+      try {
+        noble.stopScanning()
+      } catch {
+        // ignore
+      }
+    }
+
+    // wait for in-flight poll work so bluez is not mid-connect on exit
+    try {
+      await Promise.race([
+        this.queue,
+        sleep(SHUTDOWN_QUEUE_TIMEOUT_MS),
+      ])
     } catch {
       // ignore
     }
-  }
 
-  private async pollAll(): Promise<void> {
-    if (this.stopped) return
-    for (const device of this.devices.values()) {
-      if (this.stopped) return
+    for (const peripheral of this.peripherals.values()) {
       try {
-        await this.enqueue(() => this.pollDevice(device))
-      } catch (err) {
-        this.log.error(`Failed to poll ${device.displayName}: ${String(err)}`)
+        if (peripheral.state === "connected" || peripheral.state === "connecting") {
+          await peripheral.disconnectAsync()
+        }
+      } catch {
+        // ignore
       }
     }
   }
@@ -268,7 +449,6 @@ export class BleScanner {
 
     this.log.debug(`Polling ${device.displayName} (${device.address})...`)
     try {
-      // ensure disconnected before connect
       if (peripheral.state === "connected") {
         await peripheral.disconnectAsync()
       }
@@ -283,7 +463,6 @@ export class BleScanner {
       } else {
         data.name = device.displayName
       }
-      // prefer friendly product name when local name is generic
       if (!data.name || data.name === device.serialNumber) {
         data.name = `Airthings ${productName(data.model)}`
       }

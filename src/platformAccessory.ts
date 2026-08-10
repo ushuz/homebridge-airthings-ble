@@ -32,7 +32,6 @@ export class AirthingsPlatformAccessory {
   private batteryService?: Service
   private lightService?: Service
   private lastDevice?: AirthingsDevice
-  private servicesReady = false
 
   constructor(
     private readonly platform: AirthingsBlePlatform,
@@ -211,9 +210,6 @@ export class AirthingsPlatformAccessory {
   }
 
   private ensureServices(device: AirthingsDevice): void {
-    if (this.servicesReady) {
-      // still add newly-seen sensors
-    }
     const s = device.sensors
     const name = this.accessory.displayName
 
@@ -298,8 +294,6 @@ export class AirthingsPlatformAccessory {
       )
       this.bindAirQualityHandlers(this.airQualityService)
     }
-
-    this.servicesReady = true
   }
 
   private bindAirQualityHandlers(service: Service): void {
@@ -362,12 +356,9 @@ export class AirthingsPlatformAccessory {
 
   private airQualityFromSensors(s: Record<string, unknown>): number {
     const AQ = this.platform.Characteristic.AirQuality
-    // prefer radon short-term level when present
+    // level strings are derived from bq/m³ in the client before unit conversion
     const level = s[RADON_1DAY_LEVEL]
-    if (level === "good") {
-      const radon = Number(s[RADON_1DAY_AVG] ?? 0)
-      return radon < 50 ? AQ.EXCELLENT : AQ.GOOD
-    }
+    if (level === "good") return AQ.EXCELLENT
     if (level === "fair") return AQ.FAIR
     if (level === "poor") return AQ.POOR
 

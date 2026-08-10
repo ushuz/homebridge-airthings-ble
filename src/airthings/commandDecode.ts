@@ -102,7 +102,8 @@ export abstract class CommandDecode {
   protected abstract unpack(body: Buffer): number[]
 
   makeDataReceiver(): NotificationReceiver {
-    return new NotificationReceiver(this.formatTypeSize)
+    // wait for cmd byte + padding byte + packed body (full notify message)
+    return new NotificationReceiver(this.formatTypeSize + 2)
   }
 }
 

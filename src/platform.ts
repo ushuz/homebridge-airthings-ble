@@ -8,7 +8,7 @@ import type {
   Service,
 } from "homebridge"
 import { PLATFORM_NAME, PLUGIN_NAME } from "./settings.js"
-import { BleScanner, type DeviceFilter, type ScannerConfig } from "./ble/scanner.js"
+import { BleScanner, type DeviceFilter, type DiscoveredDevice, type ScannerConfig } from "./ble/scanner.js"
 import { AirthingsPlatformAccessory } from "./platformAccessory.js"
 import { createCustomCharacteristics, type CustomCharacteristics } from "./customCharacteristics.js"
 import type { AirthingsDevice } from "./airthings/types.js"
@@ -38,7 +38,9 @@ export class AirthingsBlePlatform implements DynamicPlatformPlugin {
   ) {
     this.Service = api.hap.Service
     this.Characteristic = api.hap.Characteristic
-    this.custom = createCustomCharacteristics(api)
+    this.custom = createCustomCharacteristics(api, {
+      isMetric: this.config.isMetric ?? true,
+    })
 
     this.log.debug("Finished initializing platform:", this.config.name ?? PLATFORM_NAME)
 
@@ -47,7 +49,7 @@ export class AirthingsBlePlatform implements DynamicPlatformPlugin {
     })
 
     this.api.on("shutdown", () => {
-      this.scanner?.stop()
+      void this.scanner?.stop()
     })
   }
 
@@ -67,6 +69,7 @@ export class AirthingsBlePlatform implements DynamicPlatformPlugin {
 
     this.scanner = new BleScanner(this.log, scannerConfig)
     this.scanner.setUpdateHandler((id, device) => this.onDeviceUpdate(id, device))
+    this.scanner.setDiscoveredHandler((device) => this.registerOrRestore(device))
 
     try {
       await this.scanner.init()
@@ -78,7 +81,7 @@ export class AirthingsBlePlatform implements DynamicPlatformPlugin {
       return
     }
 
-    let discovered
+    let discovered: DiscoveredDevice[]
     try {
       discovered = await this.scanner.discover()
     } catch (err) {
@@ -89,11 +92,47 @@ export class AirthingsBlePlatform implements DynamicPlatformPlugin {
     const seenUuids = new Set<string>()
 
     for (const device of discovered) {
-      const uuid = this.api.hap.uuid.generate(`airthings-ble:${device.serialNumber}`)
+      const uuid = this.registerOrRestore(device)
       seenUuids.add(uuid)
+    }
 
-      const existing = this.accessories.get(uuid)
-      if (existing) {
+    // never unregister accessories just because a scan missed them.
+    // ble sensors are often offline or out of range at startup; removing them
+    // would drop them from homekit without user action.
+    for (const [uuid, accessory] of this.accessories) {
+      if (seenUuids.has(uuid)) {
+        continue
+      }
+
+      const ctx = accessory.context.device as {
+        serialNumber?: string
+        address?: string
+        displayName?: string
+      }
+      const configured = this.isConfiguredDevice(ctx)
+      this.log.warn(
+        configured
+          ? "Configured device not seen during scan, keeping cached accessory:"
+          : "Device not seen during scan, keeping cached accessory:",
+        accessory.displayName,
+      )
+
+      const key = this.accessoryHandlerKey(ctx)
+      if (key && !this.handlers.has(key)) {
+        this.handlers.set(key, new AirthingsPlatformAccessory(this, accessory))
+      }
+    }
+
+    this.scanner.startPolling()
+  }
+
+  /** register a newly discovered device or restore from homebridge cache */
+  private registerOrRestore(device: DiscoveredDevice): string {
+    const uuid = this.api.hap.uuid.generate(`airthings-ble:${device.serialNumber}`)
+    const existing = this.accessories.get(uuid)
+
+    if (existing) {
+      if (!this.handlers.has(device.serialNumber)) {
         this.log.info("Restoring accessory:", existing.displayName)
         existing.context.device = {
           serialNumber: device.serialNumber,
@@ -101,48 +140,75 @@ export class AirthingsBlePlatform implements DynamicPlatformPlugin {
           address: device.address,
         }
         this.api.updatePlatformAccessories([existing])
-        const handler = new AirthingsPlatformAccessory(this, existing)
-        this.handlers.set(device.serialNumber, handler)
+        this.handlers.set(device.serialNumber, new AirthingsPlatformAccessory(this, existing))
       } else {
-        this.log.info("Adding accessory:", device.displayName)
-        const accessory = new this.api.platformAccessory(device.displayName, uuid)
-        accessory.context.device = {
+        // refresh context address if peripheral moved
+        existing.context.device = {
+          ...existing.context.device,
           serialNumber: device.serialNumber,
-          displayName: device.displayName,
           address: device.address,
+          displayName: device.displayName,
         }
-        const handler = new AirthingsPlatformAccessory(this, accessory)
-        this.handlers.set(device.serialNumber, handler)
-        this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory])
-        this.accessories.set(uuid, accessory)
       }
+      return uuid
     }
 
-    // remove cached accessories no longer present (only when not using a fixed device list
-    // that might be temporarily offline — still remove unknown ones after a scan)
-    for (const [uuid, accessory] of this.accessories) {
-      if (!seenUuids.has(uuid)) {
-        // keep configured devices that were not seen this scan
-        const sn = (accessory.context.device as { serialNumber?: string })?.serialNumber
-        const isConfigured = (this.config.devices ?? []).some((d) => d.serialNumber === sn)
-        if (isConfigured) {
-          this.log.warn("Configured device not seen during scan, keeping:", accessory.displayName)
-          if (!this.handlers.has(sn!)) {
-            this.handlers.set(sn!, new AirthingsPlatformAccessory(this, accessory))
-          }
-          continue
-        }
-        this.log.info("Removing accessory from cache:", accessory.displayName)
-        this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory])
-        this.accessories.delete(uuid)
-      }
+    this.log.info("Adding accessory:", device.displayName)
+    const accessory = new this.api.platformAccessory(device.displayName, uuid)
+    accessory.context.device = {
+      serialNumber: device.serialNumber,
+      displayName: device.displayName,
+      address: device.address,
     }
+    this.handlers.set(device.serialNumber, new AirthingsPlatformAccessory(this, accessory))
+    this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory])
+    this.accessories.set(uuid, accessory)
+    return uuid
+  }
 
-    this.scanner.startPolling()
+  /** stable handler map key: serial when present, else normalized address */
+  private accessoryHandlerKey(ctx: {
+    serialNumber?: string
+    address?: string
+  }): string | undefined {
+    if (ctx.serialNumber) {
+      return ctx.serialNumber
+    }
+    if (ctx.address) {
+      return ctx.address.toLowerCase().replace(/-/g, "").replace(/:/g, "")
+    }
+    return undefined
+  }
+
+  /** true if accessory matches an entry in the optional devices filter (serial or address) */
+  private isConfiguredDevice(ctx: {
+    serialNumber?: string
+    address?: string
+  }): boolean {
+    const devices = this.config.devices ?? []
+    if (devices.length === 0) {
+      return false
+    }
+    const address = ctx.address
+      ? ctx.address.toLowerCase().replace(/-/g, "").replace(/:/g, "")
+      : undefined
+    return devices.some((d) => {
+      if (d.serialNumber && ctx.serialNumber && d.serialNumber === ctx.serialNumber) {
+        return true
+      }
+      if (d.address && address) {
+        const configured = d.address.toLowerCase().replace(/-/g, "").replace(/:/g, "")
+        return configured === address
+      }
+      return false
+    })
   }
 
   private onDeviceUpdate(id: string, device: AirthingsDevice): void {
-    const handler = this.handlers.get(id)
+    let handler = this.handlers.get(id)
+    if (!handler && device.identifier) {
+      handler = this.handlers.get(device.identifier)
+    }
     if (handler) {
       handler.update(device)
     }

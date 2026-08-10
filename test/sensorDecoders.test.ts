@@ -174,3 +174,20 @@ describe("radon level and battery", () => {
     assert.equal(batteryPercentage(AirthingsDeviceType.WAVE_PLUS, 2.0), 0)
   })
 })
+
+describe("firmware version", () => {
+  it("detects outdated atom firmware", async () => {
+    const { needsFirmwareUpgrade, parseFirmwareVersion } = await import(
+      "../src/airthings/firmware.js"
+    )
+    assert.deepEqual(parseFirmwareVersion("T-SUB-2.5.0-master+0"), [2, 5, 0])
+    assert.equal(
+      needsFirmwareUpgrade("T-SUB-2.5.0-master+0", "T-SUB-2.6.1-master+0"),
+      true,
+    )
+    assert.equal(
+      needsFirmwareUpgrade("T-SUB-2.6.1-master+0", "T-SUB-2.6.1-master+0"),
+      false,
+    )
+  })
+})

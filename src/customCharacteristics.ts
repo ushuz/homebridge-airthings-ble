@@ -8,9 +8,18 @@ export type CustomCharacteristicCtors = {
   AirPressure: WithUUID<new () => Characteristic>
 }
 
+export interface CustomCharacteristicOptions {
+  /** when false, radon unit label is pCi/L */
+  isMetric?: boolean
+}
+
 /** custom radon / voc helpers for HomeKit air quality sensor */
-export function createCustomCharacteristics(api: API): CustomCharacteristicCtors {
+export function createCustomCharacteristics(
+  api: API,
+  options: CustomCharacteristicOptions = {},
+): CustomCharacteristicCtors {
   const { Characteristic } = api.hap
+  const radonUnit = options.isMetric === false ? "pCi/L" : "Bq/m³"
 
   class RadonShortTermAverage extends Characteristic {
     static readonly UUID = "000000C5-0000-1000-8000-0026BB765291"
@@ -18,7 +27,7 @@ export function createCustomCharacteristics(api: API): CustomCharacteristicCtors
       super("Radon Short Term Average", RadonShortTermAverage.UUID, {
         format: Formats.FLOAT,
         perms: [Perms.PAIRED_READ, Perms.NOTIFY],
-        unit: "Bq/m³",
+        unit: radonUnit,
         minValue: 0,
         maxValue: 65535,
         minStep: 0.01,
@@ -33,7 +42,7 @@ export function createCustomCharacteristics(api: API): CustomCharacteristicCtors
       super("Radon Long Term Average", RadonLongTermAverage.UUID, {
         format: Formats.FLOAT,
         perms: [Perms.PAIRED_READ, Perms.NOTIFY],
-        unit: "Bq/m³",
+        unit: radonUnit,
         minValue: 0,
         maxValue: 65535,
         minStep: 0.01,
