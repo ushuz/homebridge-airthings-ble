@@ -278,8 +278,10 @@ export class BleScanner {
       return withCompany
     }
 
-    const addressTrusted = this.matchesFilterByAddress(peripheral)
-    if (serviceMatch || addressTrusted) {
+    // only trust stripped payload when service uuid present or a *configured* address matches
+    // (empty devices list must NOT mean "trust every address")
+    const addressConfigured = this.matchesConfiguredAddress(peripheral)
+    if (serviceMatch || addressConfigured) {
       return parseSerial(mfg, { allowStrippedPayload: true })
     }
 
@@ -309,7 +311,7 @@ export class BleScanner {
     if (this.config.devices.length === 0) {
       return true
     }
-    if (this.matchesFilterByAddress(peripheral)) {
+    if (this.matchesConfiguredAddress(peripheral)) {
       return true
     }
     // any serial-based entry needs a connect to decide
@@ -365,9 +367,18 @@ export class BleScanner {
     })
   }
 
+  /** true when devices filter is empty (allow all) or address is listed */
   private matchesFilterByAddress(peripheral: Peripheral): boolean {
     if (this.config.devices.length === 0) {
       return true
+    }
+    return this.matchesConfiguredAddress(peripheral)
+  }
+
+  /** true only when an explicit config address entry matches (never true for empty devices) */
+  private matchesConfiguredAddress(peripheral: Peripheral): boolean {
+    if (this.config.devices.length === 0) {
+      return false
     }
     const address = normalizeAddress(peripheral.address || peripheral.id)
     return this.config.devices.some(
