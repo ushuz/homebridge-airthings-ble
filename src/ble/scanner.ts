@@ -44,33 +44,42 @@ function normalizeServiceUuid(uuid: string): string {
 
 /**
  * parse airthings serial from manufacturer data.
- * payload is company id (uint16 le) + serial (uint32 le), company id may already be stripped on some platforms.
+ * payload is company id (uint16 le) + serial (uint32 le).
+ * short 4–5 byte payloads (company id stripped) are only trusted when
+ * `allowStrippedPayload` is true (e.g. advertisement also has an airthings service uuid).
  */
-export function parseSerial(manufacturerData?: Buffer): string | null {
+export function parseSerial(
+  manufacturerData?: Buffer,
+  options?: { allowStrippedPayload?: boolean },
+): string | null {
   if (!manufacturerData || manufacturerData.length < 4) {
     return null
   }
   try {
-    // with company id prefix
+    // with company id prefix (primary trust signal)
     if (manufacturerData.length >= 6) {
       const companyId = manufacturerData.readUInt16LE(0)
       if (companyId === MFCT_ID) {
         return String(manufacturerData.readUInt32LE(2))
       }
+      return null
     }
-    // without company id (some noble backends)
-    const maybeCompany = manufacturerData.readUInt16LE(0)
-    if (maybeCompany === MFCT_ID && manufacturerData.length >= 6) {
-      return String(manufacturerData.readUInt32LE(2))
-    }
-    // treat entire buffer start as serial when length is 4-5 (payload only)
-    if (manufacturerData.length === 4 || manufacturerData.length === 5) {
+    // stripped payload: only when caller confirmed airthings service uuid (or config match)
+    if (
+      options?.allowStrippedPayload
+      && (manufacturerData.length === 4 || manufacturerData.length === 5)
+    ) {
       return String(manufacturerData.readUInt32LE(0))
     }
   } catch {
     return null
   }
   return null
+}
+
+/** normalize config serials (json numbers) and advertisement serials for comparison */
+export function normalizeSerial(value: unknown): string {
+  return String(value ?? "").trim()
 }
 
 function hasAirthingsServiceUuid(peripheral: Peripheral): boolean {
@@ -226,8 +235,11 @@ export class BleScanner {
   }
 
   private handleDiscover(peripheral: Peripheral): void {
-    const serialFromMfg = parseSerial(peripheral.advertisement?.manufacturerData)
     const serviceMatch = hasAirthingsServiceUuid(peripheral)
+    // short mfg payloads only trusted with airthings service uuid confirmation
+    const serialFromMfg = parseSerial(peripheral.advertisement?.manufacturerData, {
+      allowStrippedPayload: serviceMatch,
+    })
 
     if (!serialFromMfg && !serviceMatch) {
       return
@@ -283,7 +295,7 @@ export class BleScanner {
     const localName = peripheral.advertisement?.localName
     const configuredName = this.config.devices.find(
       (d) =>
-        d.serialNumber === serial
+        (d.serialNumber !== undefined && normalizeSerial(d.serialNumber) === normalizeSerial(serial))
         || (d.address && normalizeAddress(d.address) === normalizeAddress(address)),
     )?.name
 
@@ -310,8 +322,11 @@ export class BleScanner {
       return true
     }
     const address = normalizeAddress(peripheral.address || peripheral.id)
+    const serialKey = normalizeSerial(serial)
     return this.config.devices.some((d) => {
-      if (d.serialNumber && d.serialNumber === serial) return true
+      if (d.serialNumber !== undefined && normalizeSerial(d.serialNumber) === serialKey) {
+        return true
+      }
       if (d.address && normalizeAddress(d.address) === address) return true
       return false
     })
@@ -502,6 +517,7 @@ export class BleScanner {
       if (err instanceof UnsupportedDeviceError) {
         this.log.warn(`Unsupported device ${device.displayName}: ${err.message}`)
         this.devices.delete(device.id)
+        this.peripherals.delete(device.id)
         return null
       }
       throw err

@@ -98,25 +98,36 @@ export class AirthingsPlatformAccessory {
   }
 
   update(device: AirthingsDevice): void {
-    this.lastDevice = device
-    this.ensureServices(device)
+    // merge sensor keys so a partial poll does not wipe last good values for onGet
+    const merged: AirthingsDevice = this.lastDevice
+      ? {
+        ...this.lastDevice,
+        ...device,
+        sensors: {
+          ...this.lastDevice.sensors,
+          ...Object.fromEntries(
+            Object.entries(device.sensors).filter(([, v]) => v !== undefined && v !== null),
+          ),
+        },
+      }
+      : device
+    this.lastDevice = merged
+    this.ensureServices(merged)
 
     const info = this.accessory.getService(this.platform.Service.AccessoryInformation)!
-    info.setCharacteristic(this.platform.Characteristic.Model, productName(device.model))
-    if (device.swVersion) {
-      info.setCharacteristic(this.platform.Characteristic.FirmwareRevision, device.swVersion)
+    info.setCharacteristic(this.platform.Characteristic.Model, productName(merged.model))
+    if (merged.swVersion) {
+      info.setCharacteristic(this.platform.Characteristic.FirmwareRevision, merged.swVersion)
     }
-    if (device.hwVersion) {
-      info.setCharacteristic(this.platform.Characteristic.HardwareRevision, device.hwVersion)
+    if (merged.hwVersion) {
+      info.setCharacteristic(this.platform.Characteristic.HardwareRevision, merged.hwVersion)
     }
-    if (device.manufacturer) {
-      info.setCharacteristic(this.platform.Characteristic.Manufacturer, device.manufacturer)
+    if (merged.manufacturer) {
+      info.setCharacteristic(this.platform.Characteristic.Manufacturer, merged.manufacturer)
     }
-    if (device.identifier) {
-      info.setCharacteristic(this.platform.Characteristic.SerialNumber, device.identifier)
-    }
+    // keep discovery serial (uuid source) stable — do not overwrite with gatt identifier
 
-    const s = device.sensors
+    const s = merged.sensors
 
     if (this.temperatureService && s[TEMPERATURE] !== undefined && s[TEMPERATURE] !== null) {
       this.temperatureService.updateCharacteristic(
@@ -301,6 +312,9 @@ export class AirthingsPlatformAccessory {
       .getCharacteristic(this.platform.Characteristic.AirQuality)
       .onGet(() => this.airQualityFromSensors(this.lastDevice?.sensors ?? {}))
 
+    // drop legacy apple so2/ozone aliases used before plugin-owned radon uuids
+    this.removeLegacyRadonCharacteristics(service)
+
     const custom = this.platform.custom as Record<string, any>
     for (const key of ["RadonShortTermAverage", "RadonLongTermAverage", "VocDensity", "AirPressure"]) {
       const ctor = custom[key]
@@ -317,6 +331,25 @@ export class AirthingsPlatformAccessory {
       .onGet(() => this.num(VOC, 0))
     service.getCharacteristic(this.platform.custom.AirPressure as any)
       .onGet(() => this.num(PRESSURE, 0))
+  }
+
+  /** apple hap c5/c3 were previously reused for radon — remove from cached services */
+  private removeLegacyRadonCharacteristics(service: Service): void {
+    const legacyUuids = new Set([
+      "000000C5-0000-1000-8000-0026BB765291", // sulphur dioxide density
+      "000000C3-0000-1000-8000-0026BB765291", // ozone density
+    ].map((u) => u.toLowerCase()))
+
+    for (const char of [...service.characteristics]) {
+      const uuid = String((char as { UUID?: string }).UUID ?? "").toLowerCase()
+      if (legacyUuids.has(uuid)) {
+        try {
+          service.removeCharacteristic(char)
+        } catch {
+          // ignore if already gone
+        }
+      }
+    }
   }
 
   private num(key: string, fallback: number): number {

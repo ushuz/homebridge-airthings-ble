@@ -152,8 +152,45 @@ async function unsubscribe(char: Characteristic): Promise<void> {
   })
 }
 
+const CONNECT_SETTLE_MS = 1_500
+/** max time to wait for a timed-out updateOnce to settle after disconnect */
+const POST_TIMEOUT_WORK_WAIT_MS = 2_000
+
+async function waitForPeripheralIdle(peripheral: Peripheral, ms: number): Promise<void> {
+  if (peripheral.state === "connected" || peripheral.state === "disconnected") {
+    return
+  }
+  await Promise.race([
+    sleep(ms),
+    new Promise<void>((resolve) => {
+      const done = () => {
+        peripheral.removeListener("connect", done)
+        peripheral.removeListener("disconnect", done)
+        resolve()
+      }
+      peripheral.once("connect", done)
+      peripheral.once("disconnect", done)
+    }),
+  ])
+}
+
 async function connectPeripheral(peripheral: Peripheral): Promise<void> {
-  if (peripheral.state === "connected") {
+  // re-read state after awaits — avoid control-flow narrowing on peripheral.state
+  const current = (): string => peripheral.state as string
+
+  if (current() === "connected") {
+    return
+  }
+  // mid-transition states hang or error if connectAsync is called immediately
+  if (current() === "connecting" || current() === "disconnecting" || current() === "error") {
+    try {
+      await peripheral.disconnectAsync()
+    } catch {
+      // ignore
+    }
+    await waitForPeripheralIdle(peripheral, CONNECT_SETTLE_MS)
+  }
+  if (current() === "connected") {
     return
   }
   await peripheral.connectAsync()
@@ -168,6 +205,11 @@ async function disconnectPeripheral(peripheral: Peripheral): Promise<void> {
   } catch {
     // ignore disconnect errors
   }
+}
+
+function hasPrimarySensors(sensors: SensorMap): boolean {
+  const keys = [TEMPERATURE, HUMIDITY, RADON_1DAY_AVG, BATTERY, CO2, VOC]
+  return keys.some((k) => sensors[k] !== undefined && sensors[k] !== null)
 }
 
 export class UnsupportedDeviceError extends Error {
@@ -228,8 +270,8 @@ export class AirthingsClient {
 
   /**
    * run updateOnce with a wall-clock timeout.
-   * on timeout: invalidate generation, disconnect, and await the in-flight work
-   * so its finally cannot run against a newer retry's connection.
+   * on timeout: invalidate generation, disconnect, then wait briefly for work
+   * to settle — but never unbounded (hung noble callbacks must not wedge the queue).
    */
   private async updateOnceWithTimeout(
     peripheral: Peripheral,
@@ -256,11 +298,14 @@ export class AirthingsClient {
           this.updateGeneration++
         }
         await disconnectPeripheral(peripheral)
-        // wait for the timed-out work to finish its stack (no shared disconnect race)
-        await work.then(
-          () => undefined,
-          () => undefined,
-        )
+        // bounded wait: abandon hung work rather than block the single-adapter queue
+        await Promise.race([
+          work.then(
+            () => undefined,
+            () => undefined,
+          ),
+          sleep(POST_TIMEOUT_WORK_WAIT_MS),
+        ])
         await sleep(200)
       }
       throw err
@@ -302,6 +347,9 @@ export class AirthingsClient {
       }
 
       this.assertGeneration(generation)
+      if (!hasPrimarySensors(device.sensors)) {
+        throw new Error("No primary sensor values read from device")
+      }
       device.lastUpdateAt = Date.now()
       if (!device.name) {
         device.name = `Airthings ${productName(device.model)}`

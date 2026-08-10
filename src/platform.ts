@@ -81,12 +81,14 @@ export class AirthingsBlePlatform implements DynamicPlatformPlugin {
       return
     }
 
-    let discovered: DiscoveredDevice[]
+    let discovered: DiscoveredDevice[] = []
+    let initialDiscoverOk = true
     try {
       discovered = await this.scanner.discover()
     } catch (err) {
+      initialDiscoverOk = false
       this.log.error(`Device discovery failed: ${String(err)}`)
-      return
+      this.log.warn("Continuing with cached accessories; will re-scan on the next poll cycle")
     }
 
     const seenUuids = new Set<string>()
@@ -123,8 +125,9 @@ export class AirthingsBlePlatform implements DynamicPlatformPlugin {
       }
     }
 
-    // launch already scanned; first cycle should poll immediately without a second scan
-    this.scanner.startPolling({ skipInitialRescan: true })
+    // if launch discovery already ran, skip a redundant full scan on the first cycle.
+    // if it failed, re-scan immediately so the plugin can recover without a restart.
+    this.scanner.startPolling({ skipInitialRescan: initialDiscoverOk })
   }
 
   /** register a newly discovered device or restore from homebridge cache */
@@ -194,7 +197,11 @@ export class AirthingsBlePlatform implements DynamicPlatformPlugin {
       ? ctx.address.toLowerCase().replace(/-/g, "").replace(/:/g, "")
       : undefined
     return devices.some((d) => {
-      if (d.serialNumber && ctx.serialNumber && d.serialNumber === ctx.serialNumber) {
+      if (
+        d.serialNumber !== undefined
+        && ctx.serialNumber
+        && String(d.serialNumber).trim() === String(ctx.serialNumber).trim()
+      ) {
         return true
       }
       if (d.address && address) {
