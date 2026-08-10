@@ -4,6 +4,8 @@ Homebridge plugin for [Airthings](https://www.airthings.com/) air quality monito
 
 Sensor protocol is ported from the official [Airthings BLE library](https://github.com/Airthings/airthings-ble) used by Home Assistant.
 
+BLE stack: [`@stoprocent/noble`](https://www.npmjs.com/package/@stoprocent/noble) (includes **armv6** prebuilds for classic Pi Zero W via `@stoprocent/bluetooth-hci-socket`).
+
 ## Supported devices
 
 - Wave Gen 1
@@ -23,26 +25,23 @@ Sensor protocol is ported from the official [Airthings BLE library](https://gith
 | Node.js | 20.18.0+ (or 22.x) |
 | OS | Linux (Raspberry Pi), macOS |
 
-### Raspberry Pi Zero W / armhf
-
-1. Install BlueZ and build tools (needed for `@abandonware/noble` native module):
+### Raspberry Pi / Linux Bluetooth
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y bluetooth bluez libbluetooth-dev libudev-dev build-essential python3
-```
-
-2. Power on the adapter and allow the Homebridge user to use it:
-
-```bash
+sudo apt-get install -y bluetooth bluez libbluetooth-dev libudev-dev
 sudo systemctl enable --now bluetooth
 sudo usermod -aG bluetooth homebridge   # or the user that runs homebridge
 sudo setcap cap_net_raw+eip $(eval readlink -f $(which node))
 ```
 
-3. Reboot (or re-login) so group membership applies.
+Reboot (or re-login) so group membership applies.
 
-> **Note:** The original Pi Zero W is ARMv6. Prefer a current Homebridge OS / Node build that matches your board. Pi Zero 2 W (armhf/aarch64) is a better fit for Node 20.
+Native HCI bindings usually install from **prebuilt** binaries (including **armv6l** / Pi Zero W). Only if that fails:
+
+```bash
+sudo apt-get install -y build-essential python3
+```
 
 ## Install
 
@@ -62,7 +61,7 @@ Example `config.json` platform block:
 {
   "platform": "AirthingsBLE",
   "name": "Airthings BLE",
-  "refreshInterval": 3600,
+  "refreshInterval": 300,
   "scanDuration": 20,
   "isMetric": true,
   "debug": false,
@@ -72,7 +71,7 @@ Example `config.json` platform block:
 
 | Field | Default | Description |
 | --- | --- | --- |
-| `refreshInterval` | `3600` | Seconds between BLE polls (min 300). Longer is better for battery. |
+| `refreshInterval` | `300` | Seconds between BLE polls (min 300 = 5 minutes). |
 | `scanDuration` | `20` | Seconds to scan at startup. |
 | `isMetric` | `true` | Radon in Bq/m³ when true, pCi/L when false. |
 | `debug` | `false` | Verbose BLE logs. |
@@ -93,7 +92,7 @@ Example `config.json` platform block:
 ]
 ```
 
-Serial numbers come from BLE manufacturer data (same as the Airthings app / packaging).
+Serial numbers come from BLE manufacturer data (same as the Airthings app / packaging). On macOS, prefer serial over address (addresses are often UUIDs).
 
 ## HomeKit services
 

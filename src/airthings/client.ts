@@ -1,4 +1,4 @@
-import type { Characteristic, Peripheral, Service } from "@abandonware/noble"
+import type { Characteristic, Peripheral, Service } from "@stoprocent/noble"
 import {
   ATOM_BAT,
   ATOM_CO2,

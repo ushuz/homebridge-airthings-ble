@@ -17,9 +17,9 @@
       "refreshInterval": {
         "title": "Refresh interval (seconds)",
         "type": "integer",
-        "default": 3600,
+        "default": 300,
         "minimum": 300,
-        "description": "How often to connect and poll each device. Longer intervals reduce battery use."
+        "description": "How often to connect and poll each device (min 5 minutes). Longer intervals reduce battery use."
       },
       "scanDuration": {
         "title": "Scan duration (seconds)",

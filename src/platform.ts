@@ -61,7 +61,7 @@ export class AirthingsBlePlatform implements DynamicPlatformPlugin {
   private async launch(): Promise<void> {
     const scannerConfig: ScannerConfig = {
       scanDurationSec: Math.max(5, this.config.scanDuration ?? 20),
-      refreshIntervalSec: Math.max(300, this.config.refreshInterval ?? 3600),
+      refreshIntervalSec: Math.max(300, this.config.refreshInterval ?? 300),
       isMetric: this.config.isMetric ?? true,
       debug: this.config.debug ?? false,
       devices: this.config.devices ?? [],

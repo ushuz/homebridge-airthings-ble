@@ -1,4 +1,4 @@
-import noble, { type Peripheral } from "@abandonware/noble"
+import noble, { type Peripheral } from "@stoprocent/noble"
 import type { Logging } from "homebridge"
 import { MFCT_ID, SERVICE_UUIDS } from "../airthings/const.js"
 import { AirthingsClient, UnsupportedDeviceError } from "../airthings/client.js"
