@@ -245,21 +245,35 @@ export class BleScanner {
     // service-uuid only: stash by address; serial resolved on connect during poll
     if (serviceMatch) {
       const address = peripheral.address || peripheral.id
-      if (!this.matchesFilterByAddress(peripheral) && this.config.devices.length > 0) {
-        // allow if any filter is address-only matching, or no serial filters constrain us
-        const addressFilters = this.config.devices.filter((d) => d.address)
-        const serialOnly = this.config.devices.every((d) => d.serialNumber && !d.address)
-        if (serialOnly) {
-          // cannot match serial yet; keep pending and resolve later
-        } else if (addressFilters.length > 0 && !this.matchesFilterByAddress(peripheral)) {
-          return
-        }
+      if (!this.shouldKeepPendingCandidate(peripheral)) {
+        return
       }
       this.pendingByAddress.set(normalizeAddress(address), peripheral)
       this.log.debug(
         `Pending Airthings candidate by service uuid: ${address} (serial unknown until connect)`,
       )
     }
+  }
+
+  /**
+   * whether a service-uuid advertisement (serial unknown) should be kept for later connect.
+   * drop only when every filter lists an address and none match — mixed serial/address
+   * configs must keep the candidate so serial can be compared after connect.
+   */
+  private shouldKeepPendingCandidate(peripheral: Peripheral): boolean {
+    if (this.config.devices.length === 0) {
+      return true
+    }
+    if (this.matchesFilterByAddress(peripheral)) {
+      return true
+    }
+    // any serial-based entry needs a connect to decide
+    const hasSerialEntry = this.config.devices.some((d) => Boolean(d.serialNumber))
+    if (hasSerialEntry) {
+      return true
+    }
+    // address-only filters and this address is not among them
+    return false
   }
 
   private registerDevice(serial: string, peripheral: Peripheral): DiscoveredDevice {
@@ -313,14 +327,21 @@ export class BleScanner {
     )
   }
 
-  startPolling(): void {
+  /**
+   * @param options.skipInitialRescan when true, first cycle polls without scanning
+   *   (use after launch already ran discover)
+   */
+  startPolling(options?: { skipInitialRescan?: boolean }): void {
     this.stopped = false
+    this.skipNextRescan = options?.skipInitialRescan ?? false
     void this.pollCycle()
     this.refreshTimer = setInterval(() => {
       void this.pollCycle()
     }, this.config.refreshIntervalSec * 1000)
     this.refreshTimer.unref?.()
   }
+
+  private skipNextRescan = false
 
   /** single-flight poll: interval ticks no-op while a cycle is running */
   private async pollCycle(): Promise<void> {
@@ -332,11 +353,15 @@ export class BleScanner {
     }
     this.polling = true
     try {
+      const doRescan = !this.skipNextRescan
+      this.skipNextRescan = false
       // re-scan so devices that were offline at startup can appear
-      try {
-        await this.enqueue(() => this.discover({ clear: false }))
-      } catch (err) {
-        this.log.warn(`Re-scan failed: ${String(err)}`)
+      if (doRescan) {
+        try {
+          await this.enqueue(() => this.discover({ clear: false }))
+        } catch (err) {
+          this.log.warn(`Re-scan failed: ${String(err)}`)
+        }
       }
 
       // try pending service-uuid candidates (serial resolved on connect)

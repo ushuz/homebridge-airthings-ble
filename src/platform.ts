@@ -123,7 +123,8 @@ export class AirthingsBlePlatform implements DynamicPlatformPlugin {
       }
     }
 
-    this.scanner.startPolling()
+    // launch already scanned; first cycle should poll immediately without a second scan
+    this.scanner.startPolling({ skipInitialRescan: true })
   }
 
   /** register a newly discovered device or restore from homebridge cache */

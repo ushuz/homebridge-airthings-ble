@@ -21,8 +21,10 @@ export function createCustomCharacteristics(
   const { Characteristic } = api.hap
   const radonUnit = options.isMetric === false ? "pCi/L" : "Bq/m³"
 
+  // plugin-owned uuids (not apple hap reserved). apple c3/c5 are ozone/so2 density.
+  // namespace suffix matches airthings ble service family for easy grepping.
   class RadonShortTermAverage extends Characteristic {
-    static readonly UUID = "000000C5-0000-1000-8000-0026BB765291"
+    static readonly UUID = "A1B70001-5F8E-4C2A-9D3B-123B93F75CBA"
     constructor() {
       super("Radon Short Term Average", RadonShortTermAverage.UUID, {
         format: Formats.FLOAT,
@@ -37,7 +39,7 @@ export function createCustomCharacteristics(
   }
 
   class RadonLongTermAverage extends Characteristic {
-    static readonly UUID = "000000C3-0000-1000-8000-0026BB765291"
+    static readonly UUID = "A1B70002-5F8E-4C2A-9D3B-123B93F75CBA"
     constructor() {
       super("Radon Long Term Average", RadonLongTermAverage.UUID, {
         format: Formats.FLOAT,
@@ -51,6 +53,7 @@ export function createCustomCharacteristics(
     }
   }
 
+  // apple hap voc density (c8) — correct type for voc, not a radon alias
   class VocDensity extends Characteristic {
     static readonly UUID = "000000C8-0000-1000-8000-0026BB765291"
     constructor() {

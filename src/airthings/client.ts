@@ -228,8 +228,8 @@ export class AirthingsClient {
 
   /**
    * run updateOnce with a wall-clock timeout.
-   * on timeout, bump generation (invalidate late work), disconnect, then reject
-   * only after disconnect so retries do not race the previous gatt session.
+   * on timeout: invalidate generation, disconnect, and await the in-flight work
+   * so its finally cannot run against a newer retry's connection.
    */
   private async updateOnceWithTimeout(
     peripheral: Peripheral,
@@ -241,39 +241,31 @@ export class AirthingsClient {
     const timeoutPromise = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
         timedOut = true
-        // invalidate this attempt so late results are dropped
-        if (this.updateGeneration === generation) {
-          this.updateGeneration++
-        }
         reject(new Error(`device update timed out after ${UPDATE_TIMEOUT_MS}ms`))
       }, UPDATE_TIMEOUT_MS)
     })
 
     const work = this.updateOnce(peripheral, generation)
-      .then(async (result) => {
-        if (timedOut || this.updateGeneration !== generation) {
-          // stale attempt: ensure disconnected and discard result
-          await disconnectPeripheral(peripheral)
-          throw new Error("stale device update attempt")
-        }
-        return result
-      })
-      .catch(async (err) => {
-        if (timedOut || this.updateGeneration !== generation) {
-          await disconnectPeripheral(peripheral)
-        }
-        throw err
-      })
 
     try {
       return await Promise.race([work, timeoutPromise])
-    } finally {
-      if (timer) clearTimeout(timer)
+    } catch (err) {
       if (timedOut) {
+        // drop ownership so updateOnce finally will not disconnect a later attempt
+        if (this.updateGeneration === generation) {
+          this.updateGeneration++
+        }
         await disconnectPeripheral(peripheral)
-        // give bluez a beat to release the handle before retry
+        // wait for the timed-out work to finish its stack (no shared disconnect race)
+        await work.then(
+          () => undefined,
+          () => undefined,
+        )
         await sleep(200)
       }
+      throw err
+    } finally {
+      if (timer) clearTimeout(timer)
     }
   }
 
@@ -316,7 +308,11 @@ export class AirthingsClient {
       }
       return device
     } finally {
-      await disconnectPeripheral(peripheral)
+      // only the live generation may tear down the connection.
+      // a timed-out attempt that lost ownership must not disconnect a newer retry.
+      if (this.updateGeneration === generation) {
+        await disconnectPeripheral(peripheral)
+      }
     }
   }
 
