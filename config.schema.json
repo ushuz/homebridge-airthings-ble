@@ -1,0 +1,105 @@
+{
+  "pluginAlias": "AirthingsBLE",
+  "pluginType": "platform",
+  "singular": true,
+  "strictValidation": false,
+  "headerDisplay": "Homebridge plugin for Airthings Wave / Corentium devices over Bluetooth LE. Protocol based on the [official Airthings BLE library](https://github.com/Airthings/airthings-ble).",
+  "footerDisplay": "Requires BlueZ and a working Bluetooth adapter. On Raspberry Pi, run Homebridge as a user in the `bluetooth` group. Radon is exposed via custom characteristics and mapped to HomeKit Air Quality.",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "name": {
+        "title": "Name",
+        "type": "string",
+        "required": true,
+        "default": "Airthings BLE"
+      },
+      "refreshInterval": {
+        "title": "Refresh interval (seconds)",
+        "type": "integer",
+        "default": 3600,
+        "minimum": 300,
+        "description": "How often to connect and poll each device. Longer intervals reduce battery use."
+      },
+      "scanDuration": {
+        "title": "Scan duration (seconds)",
+        "type": "integer",
+        "default": 20,
+        "minimum": 5,
+        "description": "How long to scan for Airthings devices at startup."
+      },
+      "isMetric": {
+        "title": "Metric units for radon",
+        "type": "boolean",
+        "default": true,
+        "description": "When true, radon is reported in Bq/m³. When false, pCi/L."
+      },
+      "debug": {
+        "title": "Debug logging",
+        "type": "boolean",
+        "default": false
+      },
+      "devices": {
+        "title": "Devices",
+        "type": "array",
+        "description": "Optional. Restrict to these devices by serial number or Bluetooth address. Leave empty to auto-discover all nearby Airthings sensors.",
+        "items": {
+          "type": "object",
+          "properties": {
+            "serialNumber": {
+              "title": "Serial number",
+              "type": "string",
+              "description": "Airthings serial number from manufacturer data (digits)."
+            },
+            "address": {
+              "title": "Bluetooth address",
+              "type": "string",
+              "description": "MAC address (Linux) or UUID (macOS), e.g. aa:bb:cc:dd:ee:ff."
+            },
+            "name": {
+              "title": "Display name",
+              "type": "string",
+              "description": "Optional HomeKit display name override."
+            }
+          }
+        }
+      }
+    }
+  },
+  "layout": [
+    {
+      "type": "flex",
+      "flex-flow": "row wrap",
+      "items": [
+        "name",
+        "isMetric",
+        "debug"
+      ]
+    },
+    {
+      "type": "flex",
+      "flex-flow": "row wrap",
+      "items": [
+        "refreshInterval",
+        "scanDuration"
+      ]
+    },
+    {
+      "key": "devices",
+      "type": "array",
+      "orderable": true,
+      "buttonText": "Add device",
+      "items": [
+        {
+          "type": "flex",
+          "flex-flow": "row wrap",
+          "items": [
+            "devices[].serialNumber",
+            "devices[].address",
+            "devices[].name"
+          ]
+        }
+      ]
+    }
+  ]
+}

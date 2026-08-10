@@ -1,0 +1,16 @@
+dist
+node_modules/
+coverage
+*.lcov
+.nyc_output
+*.log
+npm-debug.log*
+.DS_Store
+.env
+.env.test
+*.tsbuildinfo
+.eslintcache
+*.tgz
+.idea
+.vscode-test
+/test/hbConfig
