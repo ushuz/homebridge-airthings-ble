@@ -236,10 +236,7 @@ export class BleScanner {
 
   private handleDiscover(peripheral: Peripheral): void {
     const serviceMatch = hasAirthingsServiceUuid(peripheral)
-    // short mfg payloads only trusted with airthings service uuid confirmation
-    const serialFromMfg = parseSerial(peripheral.advertisement?.manufacturerData, {
-      allowStrippedPayload: serviceMatch,
-    })
+    const serialFromMfg = this.parseAdvertisementSerial(peripheral, serviceMatch)
 
     if (!serialFromMfg && !serviceMatch) {
       return
@@ -265,6 +262,42 @@ export class BleScanner {
         `Pending Airthings candidate by service uuid: ${address} (serial unknown until connect)`,
       )
     }
+  }
+
+  /**
+   * company-id mfg data always accepted; stripped 4–5 byte payloads only when
+   * service uuid is present, address is configured, or parsed serial matches config.
+   */
+  private parseAdvertisementSerial(
+    peripheral: Peripheral,
+    serviceMatch: boolean,
+  ): string | null {
+    const mfg = peripheral.advertisement?.manufacturerData
+    const withCompany = parseSerial(mfg)
+    if (withCompany) {
+      return withCompany
+    }
+
+    const addressTrusted = this.matchesFilterByAddress(peripheral)
+    if (serviceMatch || addressTrusted) {
+      return parseSerial(mfg, { allowStrippedPayload: true })
+    }
+
+    // configured serial: allow stripped parse only if it matches an entry
+    if (this.config.devices.some((d) => d.serialNumber !== undefined)) {
+      const stripped = parseSerial(mfg, { allowStrippedPayload: true })
+      if (
+        stripped
+        && this.config.devices.some(
+          (d) =>
+            d.serialNumber !== undefined
+            && normalizeSerial(d.serialNumber) === normalizeSerial(stripped),
+        )
+      ) {
+        return stripped
+      }
+    }
+    return null
   }
 
   /**

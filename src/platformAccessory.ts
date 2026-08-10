@@ -3,6 +3,8 @@ import type {
   PlatformAccessory,
   Service,
 } from "homebridge"
+import { HAPStatus } from "homebridge"
+import { HapStatusError } from "hap-nodejs"
 import type { AirthingsBlePlatform } from "./platform.js"
 import {
   BATTERY,
@@ -355,6 +357,10 @@ export class AirthingsPlatformAccessory {
   private num(key: string, fallback: number): number {
     const v = this.lastDevice?.sensors[key]
     if (v === undefined || v === null) {
+      // no successful poll yet (or key never seen) — do not invent readings
+      if (!this.lastDevice) {
+        throw new HapStatusError(HAPStatus.SERVICE_COMMUNICATION_FAILURE)
+      }
       return fallback
     }
     return Number(v)

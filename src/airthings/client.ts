@@ -153,8 +153,13 @@ async function unsubscribe(char: Characteristic): Promise<void> {
 }
 
 const CONNECT_SETTLE_MS = 1_500
-/** max time to wait for a timed-out updateOnce to settle after disconnect */
-const POST_TIMEOUT_WORK_WAIT_MS = 2_000
+/**
+ * after disconnect on timeout, wait up to this long for updateOnce to exit
+ * before starting a retry (generation checks stop further gatt work either way).
+ * equals update timeout so hung callbacks cannot block forever, but we prefer
+ * not overlapping two live stacks on one peripheral.
+ */
+const POST_TIMEOUT_WORK_WAIT_MS = UPDATE_TIMEOUT_MS
 
 async function waitForPeripheralIdle(peripheral: Peripheral, ms: number): Promise<void> {
   if (peripheral.state === "connected" || peripheral.state === "disconnected") {
@@ -208,7 +213,19 @@ async function disconnectPeripheral(peripheral: Peripheral): Promise<void> {
 }
 
 function hasPrimarySensors(sensors: SensorMap): boolean {
-  const keys = [TEMPERATURE, HUMIDITY, RADON_1DAY_AVG, BATTERY, CO2, VOC]
+  // any measurement we expose to homekit counts as a usable sample
+  const keys = [
+    TEMPERATURE,
+    HUMIDITY,
+    RADON_1DAY_AVG,
+    RADON_LONGTERM_AVG,
+    BATTERY,
+    CO2,
+    VOC,
+    PRESSURE,
+    ILLUMINANCE,
+    LUX,
+  ]
   return keys.some((k) => sensors[k] !== undefined && sensors[k] !== null)
 }
 
@@ -333,7 +350,7 @@ export class AirthingsClient {
         address: peripheral.address || peripheral.id,
       })
 
-      await this.readDeviceInfo(byUuid, device)
+      await this.readDeviceInfo(byUuid, device, generation)
       this.assertGeneration(generation)
       if (device.model === AirthingsDeviceType.UNKNOWN) {
         throw new UnsupportedDeviceError("Model is not supported")
@@ -385,15 +402,22 @@ export class AirthingsClient {
     }
   }
 
-  private async readString(byUuid: Map<string, Characteristic>, uuid: string): Promise<string | null> {
+  private async readString(
+    byUuid: Map<string, Characteristic>,
+    uuid: string,
+    generation: number,
+  ): Promise<string | null> {
+    this.assertGeneration(generation)
     const char = byUuid.get(uuidKey(uuid))
     if (!char) {
       return null
     }
     try {
       const data = await readChar(char)
+      this.assertGeneration(generation)
       return data.toString("utf-8").replace(/\0/g, "").trim()
     } catch (err) {
+      this.assertGeneration(generation)
       this.logger.debug(`Failed reading ${uuid}: ${String(err)}`)
       return null
     }
@@ -402,27 +426,28 @@ export class AirthingsClient {
   private async readDeviceInfo(
     byUuid: Map<string, Characteristic>,
     device: AirthingsDevice,
+    generation: number,
   ): Promise<void> {
-    const modelRaw = await this.readString(byUuid, CHAR_UUID_MODEL_NUMBER_STRING)
+    const modelRaw = await this.readString(byUuid, CHAR_UUID_MODEL_NUMBER_STRING, generation)
     if (modelRaw) {
       device.model = deviceTypeFromRaw(modelRaw)
     }
 
-    const manufacturer = await this.readString(byUuid, CHAR_UUID_MANUFACTURER_NAME)
+    const manufacturer = await this.readString(byUuid, CHAR_UUID_MANUFACTURER_NAME, generation)
     if (manufacturer) device.manufacturer = manufacturer
 
-    const serial = await this.readString(byUuid, CHAR_UUID_SERIAL_NUMBER_STRING)
+    const serial = await this.readString(byUuid, CHAR_UUID_SERIAL_NUMBER_STRING, generation)
     if (serial && serial !== "Serial Number") {
       device.identifier = serial
     }
 
-    const fw = await this.readString(byUuid, CHAR_UUID_FIRMWARE_REV)
+    const fw = await this.readString(byUuid, CHAR_UUID_FIRMWARE_REV, generation)
     if (fw) device.swVersion = fw
 
-    const hw = await this.readString(byUuid, CHAR_UUID_HARDWARE_REV)
+    const hw = await this.readString(byUuid, CHAR_UUID_HARDWARE_REV, generation)
     if (hw) device.hwVersion = hw
 
-    const name = await this.readString(byUuid, CHAR_UUID_DEVICE_NAME)
+    const name = await this.readString(byUuid, CHAR_UUID_DEVICE_NAME, generation)
     if (name) device.name = name
 
     // wave gen 1: identifier embedded in device name AT#123456-2900...
@@ -455,11 +480,13 @@ export class AirthingsClient {
       if (decoder) {
         try {
           const data = await readChar(char)
+          this.assertGeneration(generation)
           const sensorData = decoder(data)
           delete sensorData[DATE_TIME]
           Object.assign(sensors, sensorData)
           this.applyRadonUnits(sensors, sensorData)
         } catch (err) {
+          this.assertGeneration(generation)
           this.logger.debug(`Failed reading sensor ${char.uuid}: ${String(err)}`)
         }
       }
@@ -467,7 +494,7 @@ export class AirthingsClient {
       const commandDecoder = getCommandDecoder(char.uuid)
       if (commandDecoder) {
         try {
-          const batteryData = await this.runCommand(char, commandDecoder)
+          const batteryData = await this.runCommand(char, commandDecoder, generation)
           if (batteryData?.[BATTERY] !== undefined && batteryData[BATTERY] !== null) {
             sensors[BATTERY] = batteryPercentage(device.model, Number(batteryData[BATTERY]))
           }
@@ -475,6 +502,7 @@ export class AirthingsClient {
             sensors[ILLUMINANCE] = batteryData[ILLUMINANCE]
           }
         } catch (err) {
+          this.assertGeneration(generation)
           this.logger.debug(`Failed command ${char.uuid}: ${String(err)}`)
         }
       }
@@ -486,19 +514,24 @@ export class AirthingsClient {
   private async runCommand(
     char: Characteristic,
     decoder: NonNullable<ReturnType<typeof getCommandDecoder>>,
+    generation: number,
   ): Promise<SensorMap | null> {
+    this.assertGeneration(generation)
     const receiver = decoder.makeDataReceiver()
     const onData = (data: Buffer) => receiver.asCallback(data)
 
     char.on("data", onData)
     try {
       await subscribe(char)
+      this.assertGeneration(generation)
       await writeChar(char, decoder.cmd, false)
+      this.assertGeneration(generation)
       try {
         await receiver.waitForMessage(COMMAND_TIMEOUT_MS / 1000)
       } catch {
         this.logger.warn("Timeout getting command data.")
       }
+      this.assertGeneration(generation)
       return decoder.decodeData(this.logger, receiver.message)
     } finally {
       char.removeListener("data", onData)
@@ -524,13 +557,23 @@ export class AirthingsClient {
     const sensors: SensorMap = { ...device.sensors }
 
     this.assertGeneration(generation)
-    const connectivity = await this.fetchAtom(writeCharRef, notifyCharRef, AtomRequestPath.CONNECTIVITY_MODE)
+    const connectivity = await this.fetchAtom(
+      writeCharRef,
+      notifyCharRef,
+      AtomRequestPath.CONNECTIVITY_MODE,
+      generation,
+    )
     if (connectivity) {
       Object.assign(sensors, connectivity)
     }
 
     this.assertGeneration(generation)
-    const latest = await this.fetchAtom(writeCharRef, notifyCharRef, AtomRequestPath.LATEST_VALUES)
+    const latest = await this.fetchAtom(
+      writeCharRef,
+      notifyCharRef,
+      AtomRequestPath.LATEST_VALUES,
+      generation,
+    )
     if (latest) {
       this.parseAtomSensorData(device.model, sensors, latest)
     }
@@ -546,7 +589,9 @@ export class AirthingsClient {
     writeCharRef: Characteristic,
     notifyCharRef: Characteristic,
     path: AtomRequestPath,
+    generation: number,
   ): Promise<SensorMap | null> {
+    this.assertGeneration(generation)
     const decoder = new AtomCommandDecode(path)
     // object holder so closure mutations stay visible to the control flow
     const state: { message: Buffer | null, lastPacketAt: number } = {
@@ -566,10 +611,13 @@ export class AirthingsClient {
     notifyCharRef.on("data", onData)
     try {
       await subscribe(notifyCharRef)
+      this.assertGeneration(generation)
       await writeChar(writeCharRef, decoder.cmd, false)
+      this.assertGeneration(generation)
 
       const deadline = Date.now() + COMMAND_TIMEOUT_MS
       while (Date.now() < deadline) {
+        this.assertGeneration(generation)
         if (state.message && state.message.length >= 9) {
           // wait until no new packets for settle window
           if (Date.now() - state.lastPacketAt >= ATOM_NOTIFY_SETTLE_MS) {
@@ -579,6 +627,7 @@ export class AirthingsClient {
         await sleep(40)
       }
 
+      this.assertGeneration(generation)
       if (!state.message) {
         this.logger.warn("Timeout getting atom command data.")
         return null

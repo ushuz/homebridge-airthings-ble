@@ -125,9 +125,11 @@ export class AirthingsBlePlatform implements DynamicPlatformPlugin {
       }
     }
 
-    // if launch discovery already ran, skip a redundant full scan on the first cycle.
-    // if it failed, re-scan immediately so the plugin can recover without a restart.
-    this.scanner.startPolling({ skipInitialRescan: initialDiscoverOk })
+    // skip first re-scan only when launch already found devices to poll.
+    // empty or failed discovery re-scans immediately (devices often miss short windows).
+    this.scanner.startPolling({
+      skipInitialRescan: initialDiscoverOk && discovered.length > 0,
+    })
   }
 
   /** register a newly discovered device or restore from homebridge cache */
