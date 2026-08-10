@@ -96,8 +96,20 @@ const SENSOR_CHAR_UUIDS = new Set([
 /** settle window after last atom notify packet before treating payload as complete */
 const ATOM_NOTIFY_SETTLE_MS = 150
 
+/**
+ * normalize characteristic/service uuids for map lookup.
+ * macOS/noble often returns 16-bit forms (e.g. "2a24") while we store full 128-bit strings.
+ */
 function uuidKey(uuid: string): string {
-  return uuid.replace(/-/g, "").toLowerCase()
+  const compact = uuid.replace(/-/g, "").toLowerCase()
+  // bluetooth base uuid: 0000xxxx-0000-1000-8000-00805f9b34fb
+  if (compact.length === 4) {
+    return `0000${compact}00001000800000805f9b34fb`
+  }
+  if (compact.length === 8) {
+    return `${compact}00001000800000805f9b34fb`
+  }
+  return compact
 }
 
 function sleep(ms: number): Promise<void> {
