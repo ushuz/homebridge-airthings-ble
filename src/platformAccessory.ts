@@ -3,7 +3,6 @@ import type {
   PlatformAccessory,
   Service,
 } from "homebridge"
-import { HAPStatus } from "homebridge"
 import type { AirthingsBlePlatform } from "./platform.js"
 import {
   BATTERY,
@@ -380,19 +379,14 @@ export class AirthingsPlatformAccessory {
     }
   }
 
-  private noDataYet(): never {
-    // use hap from the homebridge api instance (not a direct hap-nodejs import)
-    const { HapStatusError } = this.platform.api.hap
-    throw new HapStatusError(HAPStatus.SERVICE_COMMUNICATION_FAILURE)
-  }
-
+  /**
+   * return a reading without throwing.
+   * HapStatusError(SERVICE_COMMUNICATION_FAILURE) surfaces as "No Response" in Home —
+   * bad after a restart or between first poll and a failed later cycle.
+   */
   private num(key: string, fallback: number): number {
     const v = this.lastDevice?.sensors[key]
     if (v === undefined || v === null) {
-      // no successful poll yet — do not invent readings
-      if (!this.lastDevice) {
-        this.noDataYet()
-      }
       return fallback
     }
     return Number(v)
@@ -417,10 +411,7 @@ export class AirthingsPlatformAccessory {
   }
 
   private lightLevel(): number {
-    if (!this.lastDevice) {
-      this.noDataYet()
-    }
-    const s = this.lastDevice.sensors
+    const s = this.lastDevice?.sensors ?? {}
     if (s[LUX] !== undefined && s[LUX] !== null) {
       return Math.max(0.0001, Number(s[LUX]))
     }
@@ -429,7 +420,7 @@ export class AirthingsPlatformAccessory {
       const pct = Number(s[ILLUMINANCE])
       return Math.max(0.0001, pct * 10)
     }
-    // light service exists but this sample has no light key — use hap minimum
+    // hap light sensor requires > 0
     return 0.0001
   }
 

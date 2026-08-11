@@ -120,6 +120,15 @@ Radon short/long-term averages use custom characteristics on the Air Quality ser
 3. Reads GATT characteristics / command notify paths matching [airthings-ble](https://github.com/Airthings/airthings-ble).
 4. Updates HomeKit characteristics, then disconnects until the next interval.
 
+Each poll logs lines like `[sync] … starting` / `[sync] … ok in …ms` / `[sync] … failed` in the Homebridge log.
+
+### BLE conflicts (e.g. Govee)
+
+Only one Node process should own the Bluetooth HCI adapter. If another plugin (common: **Govee BLE**) also uses noble/HCI in the same Homebridge instance, scans/connects can fail and accessories may go unresponsive. Prefer:
+
+- Put this plugin (and/or Govee BLE) on a **child bridge**, or
+- Disable BLE for the other plugin if it can use cloud/LAN instead.
+
 ## Development
 
 ```bash

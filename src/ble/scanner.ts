@@ -433,14 +433,18 @@ export class BleScanner {
         }
       }
 
-      for (const device of this.devices.values()) {
+      const devices = [...this.devices.values()]
+      this.log.info(`[sync] poll cycle: ${devices.length} device(s)`)
+      for (const device of devices) {
         if (this.stopped) return
         try {
           await this.enqueue(() => this.pollDevice(device))
         } catch (err) {
-          this.log.error(`Failed to poll ${device.displayName}: ${String(err)}`)
+          // already logged in pollDevice; keep cycle going
+          this.log.debug(`[sync] cycle continues after error on ${device.displayName}`)
         }
       }
+      this.log.info("[sync] poll cycle complete")
     } finally {
       this.polling = false
     }
@@ -527,11 +531,15 @@ export class BleScanner {
   async pollDevice(device: DiscoveredDevice): Promise<AirthingsDevice | null> {
     const peripheral = this.peripherals.get(device.id) ?? device.peripheral
     if (!peripheral) {
-      this.log.warn(`No peripheral for ${device.id}`)
+      this.log.warn(`[sync] ${device.displayName} sn=${device.serialNumber}: no peripheral handle`)
       return null
     }
 
-    this.log.debug(`Polling ${device.displayName} (${device.address})...`)
+    const started = Date.now()
+    this.log.info(
+      `[sync] ${device.displayName} sn=${device.serialNumber}: starting`
+      + ` (address=${device.address || peripheral.id || "unknown"})`,
+    )
     try {
       if (peripheral.state === "connected") {
         await peripheral.disconnectAsync()
@@ -553,17 +561,27 @@ export class BleScanner {
 
       this.lastData.set(device.id, data)
       this.onUpdate?.(device.id, data)
+      const ms = Date.now() - started
       this.log.info(
-        `Updated ${data.name} (${productName(data.model)}): ${JSON.stringify(data.sensors)}`,
+        `[sync] ${device.displayName} sn=${device.serialNumber}: ok in ${ms}ms`
+        + ` model=${productName(data.model)} sensors=${JSON.stringify(data.sensors)}`,
       )
       return data
     } catch (err) {
+      const ms = Date.now() - started
       if (err instanceof UnsupportedDeviceError) {
-        this.log.warn(`Unsupported device ${device.displayName}: ${err.message}`)
+        this.log.warn(
+          `[sync] ${device.displayName} sn=${device.serialNumber}: unsupported after ${ms}ms`
+          + ` — ${err.message}`,
+        )
         this.devices.delete(device.id)
         this.peripherals.delete(device.id)
         return null
       }
+      this.log.error(
+        `[sync] ${device.displayName} sn=${device.serialNumber}: failed after ${ms}ms`
+        + ` — ${String(err)}`,
+      )
       throw err
     }
   }
