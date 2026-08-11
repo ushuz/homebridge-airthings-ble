@@ -439,9 +439,8 @@ export class BleScanner {
         if (this.stopped) return
         try {
           await this.enqueue(() => this.pollDevice(device))
-        } catch (err) {
+        } catch {
           // already logged in pollDevice; keep cycle going
-          this.log.debug(`[sync] cycle continues after error on ${device.displayName}`)
         }
       }
       this.log.info("[sync] poll cycle complete")
