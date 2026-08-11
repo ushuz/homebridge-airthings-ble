@@ -5,6 +5,7 @@ export type CustomCharacteristicCtors = {
   RadonShortTermAverage: WithUUID<new () => Characteristic>
   RadonLongTermAverage: WithUUID<new () => Characteristic>
   VocDensity: WithUUID<new () => Characteristic>
+  Co2Level: WithUUID<new () => Characteristic>
   AirPressure: WithUUID<new () => Characteristic>
 }
 
@@ -13,7 +14,7 @@ export interface CustomCharacteristicOptions {
   isMetric?: boolean
 }
 
-/** custom radon / voc helpers for HomeKit air quality sensor */
+/** custom radon / voc / co2 helpers for HomeKit air quality sensor */
 export function createCustomCharacteristics(
   api: API,
   options: CustomCharacteristicOptions = {},
@@ -53,7 +54,7 @@ export function createCustomCharacteristics(
     }
   }
 
-  // apple hap voc density (c8) — correct type for voc, not a radon alias
+  // apple hap voc density (c8)
   class VocDensity extends Characteristic {
     static readonly UUID = "000000C8-0000-1000-8000-0026BB765291"
     constructor() {
@@ -63,6 +64,22 @@ export function createCustomCharacteristics(
         unit: "ppb",
         minValue: 0,
         maxValue: 65535,
+        minStep: 1,
+      })
+      this.value = 0
+    }
+  }
+
+  // numeric co2 (ppm) — not the binary CarbonDioxideDetected service
+  class Co2Level extends Characteristic {
+    static readonly UUID = "A1B70003-5F8E-4C2A-9D3B-123B93F75CBA"
+    constructor() {
+      super("CO2", Co2Level.UUID, {
+        format: Formats.FLOAT,
+        perms: [Perms.PAIRED_READ, Perms.NOTIFY],
+        unit: "ppm",
+        minValue: 0,
+        maxValue: 100000,
         minStep: 1,
       })
       this.value = 0
@@ -88,6 +105,7 @@ export function createCustomCharacteristics(
     RadonShortTermAverage: RadonShortTermAverage as WithUUID<new () => Characteristic>,
     RadonLongTermAverage: RadonLongTermAverage as WithUUID<new () => Characteristic>,
     VocDensity: VocDensity as WithUUID<new () => Characteristic>,
+    Co2Level: Co2Level as WithUUID<new () => Characteristic>,
     AirPressure: AirPressure as WithUUID<new () => Characteristic>,
   }
 }

@@ -34,6 +34,14 @@
         "default": true,
         "description": "When true, radon is reported in Bq/m³. When false, pCi/L."
       },
+      "co2AlertThreshold": {
+        "title": "CO₂ alert threshold (ppm)",
+        "type": "integer",
+        "default": 1000,
+        "minimum": 400,
+        "maximum": 5000,
+        "description": "HomeKit Carbon Dioxide Detected is abnormal when CO₂ is at or above this level. Devices do not expose a threshold over BLE."
+      },
       "debug": {
         "title": "Debug logging",
         "type": "boolean",
@@ -81,7 +89,8 @@
       "flex-flow": "row wrap",
       "items": [
         "refreshInterval",
-        "scanDuration"
+        "scanDuration",
+        "co2AlertThreshold"
       ]
     },
     {

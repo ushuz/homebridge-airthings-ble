@@ -64,6 +64,7 @@ Example `config.json` platform block:
   "refreshInterval": 300,
   "scanDuration": 20,
   "isMetric": true,
+  "co2AlertThreshold": 1000,
   "debug": false,
   "devices": []
 }
@@ -74,6 +75,7 @@ Example `config.json` platform block:
 | `refreshInterval` | `300` | Seconds between BLE polls (min 300 = 5 minutes). |
 | `scanDuration` | `20` | Seconds to scan at startup. |
 | `isMetric` | `true` | Radon in Bq/m³ when true, pCi/L when false. |
+| `co2AlertThreshold` | `1000` | ppm; HomeKit CO₂ Detected is abnormal at or above this. (Not provided over BLE by the device.) |
 | `debug` | `false` | Verbose BLE logs. |
 | `devices` | `[]` | Optional filter list. Empty = auto-discover all nearby Airthings sensors. |
 
@@ -102,10 +104,12 @@ Each device is one accessory. Services are created from sensors the device repor
 | --- | --- |
 | Temperature | Temperature Sensor |
 | Humidity | Humidity Sensor |
-| CO₂ | Carbon Dioxide Sensor |
+| CO₂ | Carbon Dioxide Sensor — **Level (ppm)** + **Detected** (alert) |
 | Battery | Battery |
 | Illuminance / lux | Light Sensor |
-| Radon, VOC, pressure | Air Quality Sensor (+ custom characteristics) |
+| CO₂ (ppm), VOC, radon, pressure | Air Quality Sensor (+ custom characteristics) |
+
+CO₂ **Level** is the ppm reading. **Detected** flips abnormal when ppm ≥ `co2AlertThreshold` (Homebridge config; devices do not expose a threshold over BLE). Use Level for charts and Detected for HomeKit automations/alerts.
 
 Radon short/long-term averages use custom characteristics on the Air Quality service (HomeKit has no native radon type). Overall Air Quality is derived from radon level thresholds from the official SDK (good &lt; 100, fair &lt; 150, poor ≥ 150 Bq/m³), with CO₂/VOC fallbacks.
 

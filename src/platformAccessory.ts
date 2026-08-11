@@ -33,6 +33,8 @@ export class AirthingsPlatformAccessory {
   private batteryService?: Service
   private lightService?: Service
   private lastDevice?: AirthingsDevice
+  /** ppm at or above which CarbonDioxideDetected is abnormal */
+  private readonly co2AlertThreshold: number
 
   constructor(
     private readonly platform: AirthingsBlePlatform,
@@ -43,6 +45,10 @@ export class AirthingsPlatformAccessory {
       displayName: string
       address: string
     }
+    this.co2AlertThreshold = Math.max(
+      400,
+      Math.min(5000, this.platform.config.co2AlertThreshold ?? 1000),
+    )
 
     this.accessory
       .getService(this.platform.Service.AccessoryInformation)!
@@ -73,12 +79,7 @@ export class AirthingsPlatformAccessory {
         .onGet(() => this.num(HUMIDITY, 0))
     }
     if (this.co2Service) {
-      this.co2Service
-        .getCharacteristic(this.platform.Characteristic.CarbonDioxideLevel)
-        .onGet(() => this.num(CO2, 0))
-      this.co2Service
-        .getCharacteristic(this.platform.Characteristic.CarbonDioxideDetected)
-        .onGet(() => this.co2Detected())
+      this.bindCo2Handlers(this.co2Service)
     }
     if (this.batteryService) {
       this.batteryService
@@ -149,9 +150,7 @@ export class AirthingsPlatformAccessory {
       this.co2Service.updateCharacteristic(this.platform.Characteristic.CarbonDioxideLevel, co2)
       this.co2Service.updateCharacteristic(
         this.platform.Characteristic.CarbonDioxideDetected,
-        co2 >= 1000
-          ? this.platform.Characteristic.CarbonDioxideDetected.CO2_LEVELS_ABNORMAL
-          : this.platform.Characteristic.CarbonDioxideDetected.CO2_LEVELS_NORMAL,
+        this.co2DetectedState(co2),
       )
     }
 
@@ -186,6 +185,16 @@ export class AirthingsPlatformAccessory {
           )
         } catch {
           // characteristic may not be present on older cached accessories
+        }
+      }
+      if (s[CO2] !== undefined && s[CO2] !== null) {
+        try {
+          this.airQualityService.updateCharacteristic(
+            this.platform.custom.Co2Level,
+            Number(s[CO2]),
+          )
+        } catch {
+          // ignore
         }
       }
       if (s[RADON_1DAY_AVG] !== undefined && s[RADON_1DAY_AVG] !== null) {
@@ -254,12 +263,7 @@ export class AirthingsPlatformAccessory {
         `${name} CO2`,
         "co2",
       )
-      this.co2Service
-        .getCharacteristic(this.platform.Characteristic.CarbonDioxideLevel)
-        .onGet(() => this.num(CO2, 0))
-      this.co2Service
-        .getCharacteristic(this.platform.Characteristic.CarbonDioxideDetected)
-        .onGet(() => this.co2Detected())
+      this.bindCo2Handlers(this.co2Service)
     }
 
     if (s[BATTERY] !== undefined && s[BATTERY] !== null && !this.batteryService) {
@@ -296,6 +300,7 @@ export class AirthingsPlatformAccessory {
       s[RADON_1DAY_AVG] !== undefined
       || s[RADON_LONGTERM_AVG] !== undefined
       || s[VOC] !== undefined
+      || s[CO2] !== undefined
       || s[PRESSURE] !== undefined
 
     if (needsAirQuality && !this.airQualityService) {
@@ -308,6 +313,20 @@ export class AirthingsPlatformAccessory {
     }
   }
 
+  private bindCo2Handlers(service: Service): void {
+    // required binary alert (HomeKit automations / notifications)
+    service
+      .getCharacteristic(this.platform.Characteristic.CarbonDioxideDetected)
+      .onGet(() => this.co2Detected())
+    // numeric ppm (optional hap characteristic)
+    if (!service.testCharacteristic(this.platform.Characteristic.CarbonDioxideLevel)) {
+      service.addCharacteristic(this.platform.Characteristic.CarbonDioxideLevel)
+    }
+    service
+      .getCharacteristic(this.platform.Characteristic.CarbonDioxideLevel)
+      .onGet(() => this.num(CO2, 0))
+  }
+
   private bindAirQualityHandlers(service: Service): void {
     service
       .getCharacteristic(this.platform.Characteristic.AirQuality)
@@ -317,7 +336,13 @@ export class AirthingsPlatformAccessory {
     this.removeLegacyRadonCharacteristics(service)
 
     const custom = this.platform.custom as Record<string, any>
-    for (const key of ["RadonShortTermAverage", "RadonLongTermAverage", "VocDensity", "AirPressure"]) {
+    for (const key of [
+      "RadonShortTermAverage",
+      "RadonLongTermAverage",
+      "VocDensity",
+      "Co2Level",
+      "AirPressure",
+    ]) {
       const ctor = custom[key]
       if (!service.testCharacteristic(ctor)) {
         service.addCharacteristic(ctor)
@@ -330,6 +355,8 @@ export class AirthingsPlatformAccessory {
       .onGet(() => this.num(RADON_LONGTERM_AVG, 0))
     service.getCharacteristic(this.platform.custom.VocDensity as any)
       .onGet(() => this.num(VOC, 0))
+    service.getCharacteristic(this.platform.custom.Co2Level as any)
+      .onGet(() => this.num(CO2, 0))
     service.getCharacteristic(this.platform.custom.AirPressure as any)
       .onGet(() => this.num(PRESSURE, 0))
   }
@@ -371,11 +398,15 @@ export class AirthingsPlatformAccessory {
     return Number(v)
   }
 
-  private co2Detected(): CharacteristicValue {
-    const co2 = this.num(CO2, 0)
-    return co2 >= 1000
+  private co2DetectedState(co2Ppm: number): CharacteristicValue {
+    return co2Ppm >= this.co2AlertThreshold
       ? this.platform.Characteristic.CarbonDioxideDetected.CO2_LEVELS_ABNORMAL
       : this.platform.Characteristic.CarbonDioxideDetected.CO2_LEVELS_NORMAL
+  }
+
+  private co2Detected(): CharacteristicValue {
+    const co2 = this.num(CO2, 0)
+    return this.co2DetectedState(co2)
   }
 
   private lowBattery(): CharacteristicValue {

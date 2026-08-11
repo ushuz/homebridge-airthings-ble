@@ -18,6 +18,8 @@ export interface AirthingsPlatformConfig extends PlatformConfig {
   refreshInterval?: number
   scanDuration?: number
   isMetric?: boolean
+  /** ppm; CarbonDioxideDetected is abnormal at or above this (default 1000) */
+  co2AlertThreshold?: number
   debug?: boolean
   devices?: DeviceFilter[]
 }
