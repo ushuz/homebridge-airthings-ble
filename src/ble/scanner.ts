@@ -1,9 +1,19 @@
-import noble, { type Peripheral } from "@stoprocent/noble"
 import type { Logging } from "homebridge"
-import { MFCT_ID, SERVICE_UUIDS } from "../airthings/const.js"
+import { MFCT_ID } from "../airthings/const.js"
 import { AirthingsClient, UnsupportedDeviceError } from "../airthings/client.js"
 import type { AirthingsDevice } from "../airthings/types.js"
 import { productName } from "../airthings/deviceType.js"
+import { withBleAdapterLock } from "./adapterLock.js"
+import {
+  ensureDiscovery,
+  formatBleAddress,
+  manufacturerPayloads,
+  normalizeBleAddress,
+  openBleBus,
+  stopDiscoveryIfStarted,
+  type BleBus,
+  type NodeBleDevice,
+} from "./nodeBle.js"
 
 export interface DeviceFilter {
   serialNumber?: string
@@ -17,6 +27,8 @@ export interface ScannerConfig {
   isMetric: boolean
   debug: boolean
   devices: DeviceFilter[]
+  /** bluez adapter index (hci0 = 0); shared lock is per-adapter */
+  hciDeviceId?: number
 }
 
 export interface DiscoveredDevice {
@@ -24,29 +36,18 @@ export interface DiscoveredDevice {
   address: string
   serialNumber: string
   displayName: string
-  peripheral: Peripheral
 }
 
-const POWERED_ON_TIMEOUT_MS = 60_000
 const SHUTDOWN_QUEUE_TIMEOUT_MS = 10_000
+const LOCK_OWNER = "airthings-ble"
 
-const SERVICE_UUID_KEYS = new Set(
-  SERVICE_UUIDS.map((u) => u.replace(/-/g, "").toLowerCase()),
-)
-
-function normalizeAddress(address: string): string {
-  return address.toLowerCase().replace(/-/g, "").replace(/:/g, "")
-}
-
-function normalizeServiceUuid(uuid: string): string {
-  return uuid.replace(/-/g, "").toLowerCase()
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 /**
  * parse airthings serial from manufacturer data.
  * payload is company id (uint16 le) + serial (uint32 le).
- * short 4–5 byte payloads (company id stripped) are only trusted when
- * `allowStrippedPayload` is true (e.g. advertisement also has an airthings service uuid).
  */
 export function parseSerial(
   manufacturerData?: Buffer,
@@ -56,7 +57,6 @@ export function parseSerial(
     return null
   }
   try {
-    // with company id prefix (primary trust signal)
     if (manufacturerData.length >= 6) {
       const companyId = manufacturerData.readUInt16LE(0)
       if (companyId === MFCT_ID) {
@@ -64,7 +64,6 @@ export function parseSerial(
       }
       return null
     }
-    // stripped payload: only when caller confirmed airthings service uuid (or config match)
     if (
       options?.allowStrippedPayload
       && (manufacturerData.length === 4 || manufacturerData.length === 5)
@@ -77,38 +76,29 @@ export function parseSerial(
   return null
 }
 
-/** normalize config serials (json numbers) and advertisement serials for comparison */
 export function normalizeSerial(value: unknown): string {
   return String(value ?? "").trim()
 }
 
-function hasAirthingsServiceUuid(peripheral: Peripheral): boolean {
-  const uuids = peripheral.advertisement?.serviceUuids ?? []
-  return uuids.some((u) => SERVICE_UUID_KEYS.has(normalizeServiceUuid(u)))
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms))
-}
-
 /**
- * single-adapter ble scanner/poller.
- * serializes connects — important on pi zero w with one hci controller.
+ * bluez/dbus ble scanner/poller via node-ble.
+ * cross-plugin adapter lock coordinates with govee-ble (same protocol).
  */
 export class BleScanner {
   private readonly log: Logging
   private readonly config: ScannerConfig
   private readonly client: AirthingsClient
-  private readonly peripherals = new Map<string, Peripheral>()
   private readonly devices = new Map<string, DiscoveredDevice>()
-  /** peripherals seen by address before serial is known (service-uuid path) */
-  private readonly pendingByAddress = new Map<string, Peripheral>()
+  /** addresses seen via service-uuid path before serial is known */
+  private readonly pendingAddresses = new Set<string>()
   readonly lastData = new Map<string, AirthingsDevice>()
   private queue: Promise<void> = Promise.resolve()
   private refreshTimer: NodeJS.Timeout | null = null
   private stopped = false
   private polling = false
-  private state = "unknown"
+  private bus?: BleBus
+  /** reuse node-ble Device proxies to avoid stacking PropertiesChanged listeners */
+  private readonly bleDevices = new Map<string, NodeBleDevice>()
   private onUpdate?: (id: string, device: AirthingsDevice) => void
   private onDiscovered?: (device: DiscoveredDevice) => void
 
@@ -133,91 +123,81 @@ export class BleScanner {
     this.onUpdate = handler
   }
 
-  /** called when a new device is found during a later re-scan */
   setDiscoveredHandler(handler: (device: DiscoveredDevice) => void): void {
     this.onDiscovered = handler
   }
 
-  async init(): Promise<void> {
-    await this.waitForPoweredOn()
-    this.log.info("Bluetooth adapter ready")
+  private withAdapterLock<T>(
+    fn: () => Promise<T>,
+    acquireTimeoutMs?: number,
+  ): Promise<T> {
+    const scanMs = this.config.scanDurationSec * 1000
+    const timeout = acquireTimeoutMs ?? Math.max(120_000, scanMs + 60_000)
+    return withBleAdapterLock(
+      {
+        owner: LOCK_OWNER,
+        hciDeviceId: this.config.hciDeviceId ?? 0,
+        acquireTimeoutMs: timeout,
+        log: {
+          debug: (msg, ...args) => this.log.debug(msg, ...args),
+          info: (msg, ...args) => this.log.info(msg, ...args),
+          warn: (msg, ...args) => this.log.warn(msg, ...args),
+        },
+      },
+      fn,
+    )
   }
 
-  private waitForPoweredOn(): Promise<void> {
-    if (noble.state === "poweredOn") {
-      this.state = noble.state
-      return Promise.resolve()
-    }
-    return new Promise((resolve, reject) => {
-      let settled = false
-      const cleanup = () => {
-        noble.removeListener("stateChange", onChange)
-        clearTimeout(timer)
-      }
-      const onChange = (state: string) => {
-        this.state = state
-        this.log.debug(`Bluetooth state: ${state}`)
-        if (settled) return
-        if (state === "poweredOn") {
-          settled = true
-          cleanup()
-          resolve()
-        } else if (state === "unsupported" || state === "unauthorized") {
-          settled = true
-          cleanup()
-          reject(new Error(`Bluetooth adapter state: ${state}`))
-        }
-      }
-      const timer = setTimeout(() => {
-        if (settled) return
-        settled = true
-        cleanup()
-        reject(
-          new Error(
-            `Bluetooth adapter did not become poweredOn within ${POWERED_ON_TIMEOUT_MS / 1000}s`
-            + ` (last state: ${this.state || noble.state}).`
-            + " Enable the adapter, join the bluetooth group, and check setcap on node.",
-          ),
-        )
-      }, POWERED_ON_TIMEOUT_MS)
-
-      noble.on("stateChange", onChange)
-      if (noble.state === "poweredOn") {
-        onChange(noble.state)
-      } else {
-        this.state = noble.state
-      }
+  async init(): Promise<void> {
+    await this.withAdapterLock(async () => {
+      this.bus = await openBleBus(this.config.hciDeviceId ?? 0)
+      const addr = await this.bus.adapter.getAddress().catch(() => "?")
+      this.log.info(
+        `Bluetooth adapter ready (${this.bus.adapterName} ${addr}) via node-ble/bluez`,
+      )
     })
   }
 
+  private requireBus(): BleBus {
+    if (!this.bus) {
+      throw new Error("bluetooth bus not initialized")
+    }
+    return this.bus
+  }
+
   async discover(options?: { clear?: boolean }): Promise<DiscoveredDevice[]> {
+    return this.withAdapterLock(() => this.discoverLocked(options))
+  }
+
+  private async discoverLocked(options?: { clear?: boolean }): Promise<DiscoveredDevice[]> {
     const clear = options?.clear ?? true
     if (clear) {
       this.devices.clear()
-      this.peripherals.clear()
-      this.pendingByAddress.clear()
+      this.pendingAddresses.clear()
     }
 
-    const onDiscover = (peripheral: Peripheral) => {
-      this.handleDiscover(peripheral)
-    }
-
-    noble.on("discover", onDiscover)
+    const { adapter } = this.requireBus()
+    this.log.info(`Scanning for Airthings devices (${this.config.scanDurationSec}s)...`)
+    const startedHere = await ensureDiscovery(adapter)
     try {
-      this.log.info(`Scanning for Airthings devices (${this.config.scanDurationSec}s)...`)
-      // empty service list + allow duplicates; we filter in handleDiscover
-      // (service uuid filter is applied in software so manufacturer-only ads still match)
-      await noble.startScanningAsync([], true)
       await sleep(this.config.scanDurationSec * 1000)
-      await noble.stopScanningAsync()
+      const addresses = await adapter.devices()
+      for (const address of addresses) {
+        // bluez keeps stale Device1 nodes; rssi is only set while advertising
+        if (!(await this.isCurrentlyAdvertising(address))) {
+          continue
+        }
+        await this.inspectAdvertisement(address)
+      }
     } finally {
-      noble.removeListener("discover", onDiscover)
+      // stop only if we started — peers may still need discovery
+      await stopDiscoveryIfStarted(adapter, startedHere)
     }
 
     for (const filter of this.config.devices) {
       if (filter.address) {
-        const key = normalizeAddress(filter.address)
-        if (![...this.devices.values()].some((d) => normalizeAddress(d.address) === key)) {
+        const key = normalizeBleAddress(filter.address)
+        if (![...this.devices.values()].some((d) => normalizeBleAddress(d.address) === key)) {
           this.log.warn(
             `Configured address ${filter.address} not seen during scan;`
             + " will retry on later re-scans.",
@@ -234,117 +214,128 @@ export class BleScanner {
     return list
   }
 
-  private handleDiscover(peripheral: Peripheral): void {
-    const serviceMatch = hasAirthingsServiceUuid(peripheral)
-    const serialFromMfg = this.parseAdvertisementSerial(peripheral, serviceMatch)
+  private async getCachedDevice(address: string): Promise<NodeBleDevice> {
+    const key = normalizeBleAddress(address)
+    const cached = this.bleDevices.get(key)
+    if (cached) {
+      return cached
+    }
+    const { adapter } = this.requireBus()
+    const device = await adapter.getDevice(formatBleAddress(address))
+    this.bleDevices.set(key, device)
+    return device
+  }
 
-    if (!serialFromMfg && !serviceMatch) {
+  /** true when bluez reports a live rssi (device is advertising now) */
+  private async isCurrentlyAdvertising(address: string): Promise<boolean> {
+    try {
+      const device = await this.getCachedDevice(address)
+      const rssi = await device.getRSSI()
+      return rssi !== null && rssi !== undefined && String(rssi) !== ""
+    } catch {
+      return false
+    }
+  }
+
+  private async inspectAdvertisement(address: string): Promise<void> {
+    let device: NodeBleDevice
+    try {
+      device = await this.getCachedDevice(address)
+    } catch {
       return
     }
 
-    // manufacturer path: full id immediately
-    if (serialFromMfg) {
-      if (!this.matchesFilter(serialFromMfg, peripheral)) {
+    let mfg: Record<string, unknown> | null = null
+    try {
+      mfg = await device.getManufacturerData()
+    } catch {
+      mfg = null
+    }
+
+    const payloads = manufacturerPayloads(mfg)
+    const addressConfigured = this.matchesConfiguredAddress(address)
+    let serial: string | null = null
+    for (const payload of payloads) {
+      serial = parseSerial(payload)
+      if (serial) break
+      if (addressConfigured) {
+        serial = parseSerial(payload, { allowStrippedPayload: true })
+        if (serial) break
+      }
+      // stripped only if parsed serial matches a configured serial
+      if (this.config.devices.some((d) => d.serialNumber !== undefined)) {
+        const stripped = parseSerial(payload, { allowStrippedPayload: true })
+        if (
+          stripped
+          && this.config.devices.some(
+            (d) =>
+              d.serialNumber !== undefined
+              && normalizeSerial(d.serialNumber) === normalizeSerial(stripped),
+          )
+        ) {
+          serial = stripped
+          break
+        }
+      }
+    }
+
+    // also accept company id key 820 even if only payload present
+    if (!serial && mfg) {
+      const raw = mfg[String(MFCT_ID)] ?? mfg[MFCT_ID]
+      if (raw) {
+        const buf = Buffer.isBuffer(raw)
+          ? raw
+          : Buffer.from((raw as { data?: number[] }).data ?? [])
+        if (buf.length >= 4) {
+          try {
+            serial = String(buf.readUInt32LE(0))
+          } catch {
+            // ignore
+          }
+        }
+      }
+    }
+
+    if (serial) {
+      if (!this.matchesFilter(serial, address)) {
         return
       }
-      this.registerDevice(serialFromMfg, peripheral)
+      const localName = await device.getName().catch(() => null)
+      this.registerDevice(serial, address, localName)
       return
     }
 
-    // service-uuid only: stash by address; serial resolved on connect during poll
-    if (serviceMatch) {
-      const address = peripheral.address || peripheral.id
-      if (!this.shouldKeepPendingCandidate(peripheral)) {
-        return
-      }
-      this.pendingByAddress.set(normalizeAddress(address), peripheral)
-      this.log.debug(
-        `Pending Airthings candidate by service uuid: ${address} (serial unknown until connect)`,
-      )
+    // without mfg serial, only keep explicitly configured addresses as pending.
+    // do not connect to every bluez device when serial filters are present —
+    // that would hammer unrelated peripherals on a dense network.
+    if (this.matchesConfiguredAddress(address)) {
+      this.pendingAddresses.add(normalizeBleAddress(address))
+      this.log.debug(`Pending Airthings candidate: ${address} (serial unknown until connect)`)
     }
   }
 
-  /**
-   * company-id mfg data always accepted; stripped 4–5 byte payloads only when
-   * service uuid is present, address is configured, or parsed serial matches config.
-   */
-  private parseAdvertisementSerial(
-    peripheral: Peripheral,
-    serviceMatch: boolean,
-  ): string | null {
-    const mfg = peripheral.advertisement?.manufacturerData
-    const withCompany = parseSerial(mfg)
-    if (withCompany) {
-      return withCompany
-    }
-
-    // only trust stripped payload when service uuid present or a *configured* address matches
-    // (empty devices list must NOT mean "trust every address")
-    const addressConfigured = this.matchesConfiguredAddress(peripheral)
-    if (serviceMatch || addressConfigured) {
-      return parseSerial(mfg, { allowStrippedPayload: true })
-    }
-
-    // configured serial: allow stripped parse only if it matches an entry
-    if (this.config.devices.some((d) => d.serialNumber !== undefined)) {
-      const stripped = parseSerial(mfg, { allowStrippedPayload: true })
-      if (
-        stripped
-        && this.config.devices.some(
-          (d) =>
-            d.serialNumber !== undefined
-            && normalizeSerial(d.serialNumber) === normalizeSerial(stripped),
-        )
-      ) {
-        return stripped
-      }
-    }
-    return null
-  }
-
-  /**
-   * whether a service-uuid advertisement (serial unknown) should be kept for later connect.
-   * drop only when every filter lists an address and none match — mixed serial/address
-   * configs must keep the candidate so serial can be compared after connect.
-   */
-  private shouldKeepPendingCandidate(peripheral: Peripheral): boolean {
-    if (this.config.devices.length === 0) {
-      return true
-    }
-    if (this.matchesConfiguredAddress(peripheral)) {
-      return true
-    }
-    // any serial-based entry needs a connect to decide
-    const hasSerialEntry = this.config.devices.some((d) => Boolean(d.serialNumber))
-    if (hasSerialEntry) {
-      return true
-    }
-    // address-only filters and this address is not among them
-    return false
-  }
-
-  private registerDevice(serial: string, peripheral: Peripheral): DiscoveredDevice {
-    const address = peripheral.address || peripheral.id
+  private registerDevice(
+    serial: string,
+    address: string,
+    localName: string | null,
+  ): DiscoveredDevice {
     const id = serial
     const isNew = !this.devices.has(id)
-    const localName = peripheral.advertisement?.localName
     const configuredName = this.config.devices.find(
       (d) =>
         (d.serialNumber !== undefined && normalizeSerial(d.serialNumber) === normalizeSerial(serial))
-        || (d.address && normalizeAddress(d.address) === normalizeAddress(address)),
+        || (d.address && normalizeBleAddress(d.address) === normalizeBleAddress(address)),
     )?.name
 
     const device: DiscoveredDevice = {
       id,
-      address,
+      address: normalizeBleAddress(address),
       serialNumber: serial,
       displayName: configuredName || localName || `Airthings ${serial}`,
-      peripheral,
     }
 
     this.devices.set(id, device)
-    this.peripherals.set(id, peripheral)
-    this.pendingByAddress.delete(normalizeAddress(address))
+    this.pendingAddresses.delete(normalizeBleAddress(address))
 
     if (isNew) {
       this.onDiscovered?.(device)
@@ -352,44 +343,31 @@ export class BleScanner {
     return device
   }
 
-  private matchesFilter(serial: string, peripheral: Peripheral): boolean {
+  private matchesFilter(serial: string, address: string): boolean {
     if (this.config.devices.length === 0) {
       return true
     }
-    const address = normalizeAddress(peripheral.address || peripheral.id)
+    const addr = normalizeBleAddress(address)
     const serialKey = normalizeSerial(serial)
     return this.config.devices.some((d) => {
       if (d.serialNumber !== undefined && normalizeSerial(d.serialNumber) === serialKey) {
         return true
       }
-      if (d.address && normalizeAddress(d.address) === address) return true
+      if (d.address && normalizeBleAddress(d.address) === addr) return true
       return false
     })
   }
 
-  /** true when devices filter is empty (allow all) or address is listed */
-  private matchesFilterByAddress(peripheral: Peripheral): boolean {
-    if (this.config.devices.length === 0) {
-      return true
-    }
-    return this.matchesConfiguredAddress(peripheral)
-  }
-
-  /** true only when an explicit config address entry matches (never true for empty devices) */
-  private matchesConfiguredAddress(peripheral: Peripheral): boolean {
+  private matchesConfiguredAddress(address: string): boolean {
     if (this.config.devices.length === 0) {
       return false
     }
-    const address = normalizeAddress(peripheral.address || peripheral.id)
+    const addr = normalizeBleAddress(address)
     return this.config.devices.some(
-      (d) => d.address && normalizeAddress(d.address) === address,
+      (d) => d.address && normalizeBleAddress(d.address) === addr,
     )
   }
 
-  /**
-   * @param options.skipInitialRescan when true, first cycle polls without scanning
-   *   (use after launch already ran discover)
-   */
   startPolling(options?: { skipInitialRescan?: boolean }): void {
     this.stopped = false
     this.skipNextRescan = options?.skipInitialRescan ?? false
@@ -402,7 +380,6 @@ export class BleScanner {
 
   private skipNextRescan = false
 
-  /** single-flight poll: interval ticks no-op while a cycle is running */
   private async pollCycle(): Promise<void> {
     if (this.stopped || this.polling) {
       if (this.polling) {
@@ -414,7 +391,6 @@ export class BleScanner {
     try {
       const doRescan = !this.skipNextRescan
       this.skipNextRescan = false
-      // re-scan so devices that were offline at startup can appear
       if (doRescan) {
         try {
           await this.enqueue(() => this.discover({ clear: false }))
@@ -423,11 +399,10 @@ export class BleScanner {
         }
       }
 
-      // try pending service-uuid candidates (serial resolved on connect)
-      for (const [addr, peripheral] of [...this.pendingByAddress.entries()]) {
+      for (const addr of [...this.pendingAddresses]) {
         if (this.stopped) return
         try {
-          await this.enqueue(() => this.resolvePending(addr, peripheral))
+          await this.enqueue(() => this.resolvePending(addr))
         } catch (err) {
           this.log.debug(`Failed resolving pending ${addr}: ${String(err)}`)
         }
@@ -440,7 +415,7 @@ export class BleScanner {
         try {
           await this.enqueue(() => this.pollDevice(device))
         } catch {
-          // already logged in pollDevice; keep cycle going
+          // already logged
         }
       }
       this.log.info("[sync] poll cycle complete")
@@ -449,34 +424,70 @@ export class BleScanner {
     }
   }
 
-  private async resolvePending(addr: string, peripheral: Peripheral): Promise<void> {
+  private async resolvePending(addr: string): Promise<void> {
+    return this.withAdapterLock(() => this.resolvePendingLocked(addr))
+  }
+
+  private async resolvePendingLocked(addr: string): Promise<void> {
     this.log.debug(`Connecting to resolve serial for ${addr}...`)
+    const { adapter } = this.requireBus()
+    // prefer discovery stopped before gatt connect
+    const wasDiscovering = await adapter.isDiscovering()
+    if (wasDiscovering) {
+      try { await adapter.stopDiscovery() } catch { /* ignore */ }
+    }
     try {
-      if (peripheral.state === "connected") {
-        await peripheral.disconnectAsync()
-      }
-      const data = await this.client.updateDevice(peripheral)
+      const bleDevice = await this.getBleDevice(addr)
+      const data = await this.client.updateDevice(bleDevice)
       const serial = data.identifier
       if (!serial) {
         this.log.warn(`Could not resolve serial for ${addr}; dropping candidate`)
-        this.pendingByAddress.delete(addr)
+        this.pendingAddresses.delete(normalizeBleAddress(addr))
         return
       }
-      if (!this.matchesFilter(serial, peripheral)) {
+      if (!this.matchesFilter(serial, addr)) {
         this.log.debug(`Resolved ${serial} at ${addr} but filtered out by config`)
-        this.pendingByAddress.delete(addr)
+        this.pendingAddresses.delete(normalizeBleAddress(addr))
         return
       }
-      const device = this.registerDevice(serial, peripheral)
+      const device = this.registerDevice(serial, addr, data.name ?? null)
       this.lastData.set(device.id, data)
       this.onUpdate?.(device.id, data)
     } catch (err) {
       if (err instanceof UnsupportedDeviceError) {
         this.log.warn(`Unsupported pending device ${addr}: ${err.message}`)
-        this.pendingByAddress.delete(addr)
+        this.pendingAddresses.delete(normalizeBleAddress(addr))
         return
       }
       throw err
+    } finally {
+      if (wasDiscovering) {
+        try {
+          if (!(await adapter.isDiscovering())) {
+            await adapter.startDiscovery()
+          }
+        } catch {
+          // ignore
+        }
+      }
+    }
+  }
+
+  private async getBleDevice(address: string): Promise<NodeBleDevice> {
+    const key = normalizeBleAddress(address)
+    try {
+      return await this.getCachedDevice(address)
+    } catch {
+      // wait briefly with discovery if not in cache
+      const { adapter } = this.requireBus()
+      const started = await ensureDiscovery(adapter)
+      try {
+        const device = await adapter.waitDevice(formatBleAddress(address), 15_000, 500)
+        this.bleDevices.set(key, device)
+        return device
+      } finally {
+        await stopDiscoveryIfStarted(adapter, started)
+      }
     }
   }
 
@@ -486,17 +497,7 @@ export class BleScanner {
       clearInterval(this.refreshTimer)
       this.refreshTimer = null
     }
-    try {
-      await noble.stopScanningAsync()
-    } catch {
-      try {
-        noble.stopScanning()
-      } catch {
-        // ignore
-      }
-    }
 
-    // wait for in-flight poll work so bluez is not mid-connect on exit
     try {
       await Promise.race([
         this.queue,
@@ -506,18 +507,33 @@ export class BleScanner {
       // ignore
     }
 
-    for (const peripheral of this.peripherals.values()) {
-      try {
-        if (peripheral.state === "connected" || peripheral.state === "connecting") {
-          await peripheral.disconnectAsync()
+    try {
+      await this.withAdapterLock(async () => {
+        if (this.bus) {
+          try {
+            if (await this.bus.adapter.isDiscovering()) {
+              await this.bus.adapter.stopDiscovery()
+            }
+          } catch {
+            // ignore
+          }
+          this.bleDevices.clear()
+          this.bus.destroy()
+          this.bus = undefined
         }
+      }, 5_000)
+    } catch (err) {
+      this.log.debug(`ble teardown lock skipped: ${String(err)}`)
+      this.bleDevices.clear()
+      try {
+        this.bus?.destroy()
       } catch {
         // ignore
       }
+      this.bus = undefined
     }
   }
 
-  /** serialize ble operations on the single adapter */
   private enqueue<T>(fn: () => Promise<T>): Promise<T> {
     const run = this.queue.then(fn, fn)
     this.queue = run.then(
@@ -528,44 +544,57 @@ export class BleScanner {
   }
 
   async pollDevice(device: DiscoveredDevice): Promise<AirthingsDevice | null> {
-    const peripheral = this.peripherals.get(device.id) ?? device.peripheral
-    if (!peripheral) {
-      this.log.warn(`[sync] ${device.displayName} sn=${device.serialNumber}: no peripheral handle`)
-      return null
-    }
+    return this.withAdapterLock(() => this.pollDeviceLocked(device))
+  }
 
+  private async pollDeviceLocked(device: DiscoveredDevice): Promise<AirthingsDevice | null> {
     const started = Date.now()
     this.log.info(
       `[sync] ${device.displayName} sn=${device.serialNumber}: starting`
-      + ` (address=${device.address || peripheral.id || "unknown"})`,
+      + ` (address=${device.address || "unknown"})`,
     )
     try {
-      if (peripheral.state === "connected") {
-        await peripheral.disconnectAsync()
+      const { adapter } = this.requireBus()
+      const wasDiscovering = await adapter.isDiscovering()
+      if (wasDiscovering) {
+        try { await adapter.stopDiscovery() } catch { /* ignore */ }
       }
-      const data = await this.client.updateDevice(peripheral)
-      if (!data.identifier) {
-        data.identifier = device.serialNumber
-      }
-      if (data.name) {
-        device.displayName = device.displayName.startsWith("Airthings ")
-          ? data.name
-          : device.displayName
-      } else {
-        data.name = device.displayName
-      }
-      if (!data.name || data.name === device.serialNumber) {
-        data.name = `Airthings ${productName(data.model)}`
-      }
+      try {
+        const bleDevice = await this.getBleDevice(device.address)
+        const data = await this.client.updateDevice(bleDevice, device.displayName)
+        if (!data.identifier) {
+          data.identifier = device.serialNumber
+        }
+        if (data.name) {
+          device.displayName = device.displayName.startsWith("Airthings ")
+            ? data.name
+            : device.displayName
+        } else {
+          data.name = device.displayName
+        }
+        if (!data.name || data.name === device.serialNumber) {
+          data.name = `Airthings ${productName(data.model)}`
+        }
 
-      this.lastData.set(device.id, data)
-      this.onUpdate?.(device.id, data)
-      const ms = Date.now() - started
-      this.log.info(
-        `[sync] ${device.displayName} sn=${device.serialNumber}: ok in ${ms}ms`
-        + ` model=${productName(data.model)} sensors=${JSON.stringify(data.sensors)}`,
-      )
-      return data
+        this.lastData.set(device.id, data)
+        this.onUpdate?.(device.id, data)
+        const ms = Date.now() - started
+        this.log.info(
+          `[sync] ${device.displayName} sn=${device.serialNumber}: ok in ${ms}ms`
+          + ` model=${productName(data.model)} sensors=${JSON.stringify(data.sensors)}`,
+        )
+        return data
+      } finally {
+        if (wasDiscovering) {
+          try {
+            if (!(await adapter.isDiscovering())) {
+              await adapter.startDiscovery()
+            }
+          } catch {
+            // ignore
+          }
+        }
+      }
     } catch (err) {
       const ms = Date.now() - started
       if (err instanceof UnsupportedDeviceError) {
@@ -574,7 +603,6 @@ export class BleScanner {
           + ` — ${err.message}`,
         )
         this.devices.delete(device.id)
-        this.peripherals.delete(device.id)
         return null
       }
       this.log.error(

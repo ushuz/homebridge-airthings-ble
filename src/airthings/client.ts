@@ -1,4 +1,3 @@
-import type { Characteristic, Peripheral, Service } from "@stoprocent/noble"
 import {
   ATOM_BAT,
   ATOM_CO2,
@@ -77,155 +76,67 @@ import {
 import { getRadonLevel } from "./radonLevel.js"
 import { getSensorDecoder } from "./sensorDecoders.js"
 import { AirthingsDevice, emptyDevice } from "./types.js"
+import {
+  mapAllCharacteristics,
+  type NodeBleDevice,
+  type NodeBleGattCharacteristic,
+  uuidKey,
+} from "../ble/nodeBle.js"
 
-const SENSOR_CHAR_UUIDS = new Set([
-  CHAR_UUID_DATETIME,
-  CHAR_UUID_TEMPERATURE,
-  CHAR_UUID_HUMIDITY,
-  CHAR_UUID_RADON_1DAYAVG,
-  CHAR_UUID_RADON_LONG_TERM_AVG,
-  CHAR_UUID_ILLUMINANCE_ACCELEROMETER,
-  CHAR_UUID_WAVE_PLUS_DATA,
-  CHAR_UUID_WAVE_2_DATA,
-  CHAR_UUID_WAVEMINI_DATA,
-  COMMAND_UUID_WAVE_2,
-  COMMAND_UUID_WAVE_PLUS,
-  COMMAND_UUID_WAVE_MINI,
-].map((u) => u.replace(/-/g, "").toLowerCase()))
+const SENSOR_CHAR_UUIDS = new Set(
+  [
+    CHAR_UUID_DATETIME,
+    CHAR_UUID_TEMPERATURE,
+    CHAR_UUID_HUMIDITY,
+    CHAR_UUID_RADON_1DAYAVG,
+    CHAR_UUID_RADON_LONG_TERM_AVG,
+    CHAR_UUID_ILLUMINANCE_ACCELEROMETER,
+    CHAR_UUID_WAVE_PLUS_DATA,
+    CHAR_UUID_WAVE_2_DATA,
+    CHAR_UUID_WAVEMINI_DATA,
+    COMMAND_UUID_WAVE_2,
+    COMMAND_UUID_WAVE_PLUS,
+    COMMAND_UUID_WAVE_MINI,
+  ].map((u) => uuidKey(u)),
+)
 
 /** settle window after last atom notify packet before treating payload as complete */
 const ATOM_NOTIFY_SETTLE_MS = 150
-
-/**
- * normalize characteristic/service uuids for map lookup.
- * macOS/noble often returns 16-bit forms (e.g. "2a24") while we store full 128-bit strings.
- */
-function uuidKey(uuid: string): string {
-  const compact = uuid.replace(/-/g, "").toLowerCase()
-  // bluetooth base uuid: 0000xxxx-0000-1000-8000-00805f9b34fb
-  if (compact.length === 4) {
-    return `0000${compact}00001000800000805f9b34fb`
-  }
-  if (compact.length === 8) {
-    return `${compact}00001000800000805f9b34fb`
-  }
-  return compact
-}
+const CONNECT_SETTLE_MS = 1_500
+const POST_TIMEOUT_WORK_WAIT_MS = UPDATE_TIMEOUT_MS
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-async function readChar(char: Characteristic): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    char.read((error, data) => {
-      if (error) {
-        reject(error)
-        return
-      }
-      resolve(data ?? Buffer.alloc(0))
-    })
-  })
-}
-
-async function writeChar(char: Characteristic, data: Buffer, withoutResponse = false): Promise<void> {
-  return new Promise((resolve, reject) => {
-    char.write(data, withoutResponse, (error) => {
-      if (error) {
-        reject(error)
-        return
-      }
-      resolve()
-    })
-  })
-}
-
-async function subscribe(char: Characteristic): Promise<void> {
-  return new Promise((resolve, reject) => {
-    char.subscribe((error) => {
-      if (error) {
-        reject(error)
-        return
-      }
-      resolve()
-    })
-  })
-}
-
-async function unsubscribe(char: Characteristic): Promise<void> {
-  return new Promise((resolve, reject) => {
-    char.unsubscribe((error) => {
-      if (error) {
-        reject(error)
-        return
-      }
-      resolve()
-    })
-  })
-}
-
-const CONNECT_SETTLE_MS = 1_500
-/**
- * after disconnect on timeout, wait up to this long for updateOnce to exit
- * before starting a retry (generation checks stop further gatt work either way).
- * equals update timeout so hung callbacks cannot block forever, but we prefer
- * not overlapping two live stacks on one peripheral.
- */
-const POST_TIMEOUT_WORK_WAIT_MS = UPDATE_TIMEOUT_MS
-
-async function waitForPeripheralIdle(peripheral: Peripheral, ms: number): Promise<void> {
-  if (peripheral.state === "connected" || peripheral.state === "disconnected") {
-    return
-  }
-  await Promise.race([
-    sleep(ms),
-    new Promise<void>((resolve) => {
-      const done = () => {
-        peripheral.removeListener("connect", done)
-        peripheral.removeListener("disconnect", done)
-        resolve()
-      }
-      peripheral.once("connect", done)
-      peripheral.once("disconnect", done)
-    }),
-  ])
-}
-
-async function connectPeripheral(peripheral: Peripheral): Promise<void> {
-  // re-read state after awaits — avoid control-flow narrowing on peripheral.state
-  const current = (): string => peripheral.state as string
-
-  if (current() === "connected") {
-    return
-  }
-  // mid-transition states hang or error if connectAsync is called immediately
-  if (current() === "connecting" || current() === "disconnecting" || current() === "error") {
-    try {
-      await peripheral.disconnectAsync()
-    } catch {
-      // ignore
-    }
-    await waitForPeripheralIdle(peripheral, CONNECT_SETTLE_MS)
-  }
-  if (current() === "connected") {
-    return
-  }
-  await peripheral.connectAsync()
-}
-
-async function disconnectPeripheral(peripheral: Peripheral): Promise<void> {
-  if (peripheral.state === "disconnected") {
-    return
-  }
+async function isConnected(device: NodeBleDevice): Promise<boolean> {
   try {
-    await peripheral.disconnectAsync()
+    const v = await device.isConnected()
+    return v === true || v === "true"
+  } catch {
+    return false
+  }
+}
+
+async function connectDevice(device: NodeBleDevice): Promise<void> {
+  if (await isConnected(device)) {
+    return
+  }
+  await device.connect()
+  await sleep(CONNECT_SETTLE_MS)
+}
+
+async function disconnectDevice(device: NodeBleDevice): Promise<void> {
+  // always try disconnect — cancels an in-progress bluez Connect that has not
+  // flipped Connected=true yet (e.g. after a wall-clock timeout).
+  try {
+    await device.disconnect()
   } catch {
     // ignore disconnect errors
   }
 }
 
 function hasPrimarySensors(sensors: SensorMap): boolean {
-  // any measurement we expose to homekit counts as a usable sample
   const keys = [
     TEMPERATURE,
     HUMIDITY,
@@ -255,7 +166,7 @@ export interface ClientOptions {
 }
 
 /**
- * connect to an airthings peripheral and read sensor data.
+ * connect to an airthings device over node-ble/bluez and read sensor data.
  * protocol port of https://github.com/Airthings/airthings-ble
  */
 export class AirthingsClient {
@@ -271,8 +182,9 @@ export class AirthingsClient {
     this.maxAttempts = options.maxAttempts ?? DEFAULT_MAX_UPDATE_ATTEMPTS
   }
 
-  async updateDevice(peripheral: Peripheral): Promise<AirthingsDevice> {
-    const name = peripheral.advertisement?.localName ?? ""
+  async updateDevice(device: NodeBleDevice, _displayName?: string): Promise<AirthingsDevice> {
+    // use the ble advertisement/gatt name for model rejection — not a user label
+    const name = await device.getName().catch(() => "") || ""
     if (name.includes("Renew") || name.includes("View")) {
       throw new UnsupportedDeviceError(`Model ${name} is not supported`)
     }
@@ -281,13 +193,11 @@ export class AirthingsClient {
     for (let attempt = 0; attempt < this.maxAttempts; attempt++) {
       const generation = ++this.updateGeneration
       try {
-        return await this.updateOnceWithTimeout(peripheral, generation)
+        return await this.updateOnceWithTimeout(device, generation)
       } catch (err) {
         lastError = err
         this.logger.debug(`Update attempt ${attempt + 1} failed: ${String(err)}`)
-        // force disconnect and wait so the timed-out attempt finishes cleanup
-        // before the next connect (single hci adapter on pi zero w)
-        await disconnectPeripheral(peripheral)
+        await disconnectDevice(device)
         await sleep(300)
         if (attempt < this.maxAttempts - 1) {
           await sleep(200)
@@ -297,13 +207,8 @@ export class AirthingsClient {
     throw lastError instanceof Error ? lastError : new Error(String(lastError))
   }
 
-  /**
-   * run updateOnce with a wall-clock timeout.
-   * on timeout: invalidate generation, disconnect, then wait briefly for work
-   * to settle — but never unbounded (hung noble callbacks must not wedge the queue).
-   */
   private async updateOnceWithTimeout(
-    peripheral: Peripheral,
+    device: NodeBleDevice,
     generation: number,
   ): Promise<AirthingsDevice> {
     let timer: NodeJS.Timeout | undefined
@@ -316,18 +221,16 @@ export class AirthingsClient {
       }, UPDATE_TIMEOUT_MS)
     })
 
-    const work = this.updateOnce(peripheral, generation)
+    const work = this.updateOnce(device, generation)
 
     try {
       return await Promise.race([work, timeoutPromise])
     } catch (err) {
       if (timedOut) {
-        // drop ownership so updateOnce finally will not disconnect a later attempt
         if (this.updateGeneration === generation) {
           this.updateGeneration++
         }
-        await disconnectPeripheral(peripheral)
-        // bounded wait: abandon hung work rather than block the single-adapter queue
+        await disconnectDevice(device)
         await Promise.race([
           work.then(
             () => undefined,
@@ -344,51 +247,44 @@ export class AirthingsClient {
   }
 
   private async updateOnce(
-    peripheral: Peripheral,
+    device: NodeBleDevice,
     generation: number,
   ): Promise<AirthingsDevice> {
     this.assertGeneration(generation)
-    await connectPeripheral(peripheral)
+    await connectDevice(device)
     this.assertGeneration(generation)
     try {
-      const { characteristics } = await peripheral.discoverAllServicesAndCharacteristicsAsync()
+      const byUuid = await mapAllCharacteristics(device)
       this.assertGeneration(generation)
-      const byUuid = new Map<string, Characteristic>()
-      for (const char of characteristics) {
-        byUuid.set(uuidKey(char.uuid), char)
-      }
 
-      const device = emptyDevice({
-        address: peripheral.address || peripheral.id,
-      })
+      const address = await device.getAddress().catch(() => "")
+      const airthings = emptyDevice({ address })
 
-      await this.readDeviceInfo(byUuid, device, generation)
+      await this.readDeviceInfo(byUuid, airthings, generation)
       this.assertGeneration(generation)
-      if (device.model === AirthingsDeviceType.UNKNOWN) {
+      if (airthings.model === AirthingsDeviceType.UNKNOWN) {
         throw new UnsupportedDeviceError("Model is not supported")
       }
 
-      if (isAtomDevice(device.model)) {
-        this.warnIfFirmwareOutdated(device)
-        await this.readAtomSensors(byUuid, device, generation)
+      if (isAtomDevice(airthings.model)) {
+        this.warnIfFirmwareOutdated(airthings)
+        await this.readAtomSensors(byUuid, airthings, generation)
       } else {
-        await this.readWaveSensors(byUuid, device, generation)
+        await this.readWaveSensors(byUuid, airthings, generation)
       }
 
       this.assertGeneration(generation)
-      if (!hasPrimarySensors(device.sensors)) {
+      if (!hasPrimarySensors(airthings.sensors)) {
         throw new Error("No primary sensor values read from device")
       }
-      device.lastUpdateAt = Date.now()
-      if (!device.name) {
-        device.name = `Airthings ${productName(device.model)}`
+      airthings.lastUpdateAt = Date.now()
+      if (!airthings.name) {
+        airthings.name = `Airthings ${productName(airthings.model)}`
       }
-      return device
+      return airthings
     } finally {
-      // only the live generation may tear down the connection.
-      // a timed-out attempt that lost ownership must not disconnect a newer retry.
       if (this.updateGeneration === generation) {
-        await disconnectPeripheral(peripheral)
+        await disconnectDevice(device)
       }
     }
   }
@@ -415,17 +311,17 @@ export class AirthingsClient {
   }
 
   private async readString(
-    byUuid: Map<string, Characteristic>,
+    byUuid: Map<string, { uuid: string, char: NodeBleGattCharacteristic }>,
     uuid: string,
     generation: number,
   ): Promise<string | null> {
     this.assertGeneration(generation)
-    const char = byUuid.get(uuidKey(uuid))
-    if (!char) {
+    const entry = byUuid.get(uuidKey(uuid))
+    if (!entry) {
       return null
     }
     try {
-      const data = await readChar(char)
+      const data = await entry.char.readValue()
       this.assertGeneration(generation)
       return data.toString("utf-8").replace(/\0/g, "").trim()
     } catch (err) {
@@ -436,7 +332,7 @@ export class AirthingsClient {
   }
 
   private async readDeviceInfo(
-    byUuid: Map<string, Characteristic>,
+    byUuid: Map<string, { uuid: string, char: NodeBleGattCharacteristic }>,
     device: AirthingsDevice,
     generation: number,
   ): Promise<void> {
@@ -462,7 +358,6 @@ export class AirthingsClient {
     const name = await this.readString(byUuid, CHAR_UUID_DEVICE_NAME, generation)
     if (name) device.name = name
 
-    // wave gen 1: identifier embedded in device name AT#123456-2900...
     if (
       device.model === AirthingsDeviceType.WAVE_GEN_1
       && device.name
@@ -476,22 +371,22 @@ export class AirthingsClient {
   }
 
   private async readWaveSensors(
-    byUuid: Map<string, Characteristic>,
+    byUuid: Map<string, { uuid: string, char: NodeBleGattCharacteristic }>,
     device: AirthingsDevice,
     generation: number,
   ): Promise<void> {
     const sensors: SensorMap = { ...device.sensors }
 
-    for (const [key, char] of byUuid) {
+    for (const [key, entry] of byUuid) {
       this.assertGeneration(generation)
       if (!SENSOR_CHAR_UUIDS.has(key)) {
         continue
       }
 
-      const decoder = getSensorDecoder(char.uuid)
+      const decoder = getSensorDecoder(entry.uuid)
       if (decoder) {
         try {
-          const data = await readChar(char)
+          const data = await entry.char.readValue()
           this.assertGeneration(generation)
           const sensorData = decoder(data)
           delete sensorData[DATE_TIME]
@@ -499,14 +394,14 @@ export class AirthingsClient {
           this.applyRadonUnits(sensors, sensorData)
         } catch (err) {
           this.assertGeneration(generation)
-          this.logger.debug(`Failed reading sensor ${char.uuid}: ${String(err)}`)
+          this.logger.debug(`Failed reading sensor ${entry.uuid}: ${String(err)}`)
         }
       }
 
-      const commandDecoder = getCommandDecoder(char.uuid)
+      const commandDecoder = getCommandDecoder(entry.uuid)
       if (commandDecoder) {
         try {
-          const batteryData = await this.runCommand(char, commandDecoder, generation)
+          const batteryData = await this.runCommand(entry.char, commandDecoder, generation)
           if (batteryData?.[BATTERY] !== undefined && batteryData[BATTERY] !== null) {
             sensors[BATTERY] = batteryPercentage(device.model, Number(batteryData[BATTERY]))
           }
@@ -515,7 +410,7 @@ export class AirthingsClient {
           }
         } catch (err) {
           this.assertGeneration(generation)
-          this.logger.debug(`Failed command ${char.uuid}: ${String(err)}`)
+          this.logger.debug(`Failed command ${entry.uuid}: ${String(err)}`)
         }
       }
     }
@@ -524,7 +419,7 @@ export class AirthingsClient {
   }
 
   private async runCommand(
-    char: Characteristic,
+    char: NodeBleGattCharacteristic,
     decoder: NonNullable<ReturnType<typeof getCommandDecoder>>,
     generation: number,
   ): Promise<SensorMap | null> {
@@ -532,11 +427,11 @@ export class AirthingsClient {
     const receiver = decoder.makeDataReceiver()
     const onData = (data: Buffer) => receiver.asCallback(data)
 
-    char.on("data", onData)
+    char.on("valuechanged", onData)
     try {
-      await subscribe(char)
+      await char.startNotifications()
       this.assertGeneration(generation)
-      await writeChar(char, decoder.cmd, false)
+      await char.writeValue(decoder.cmd, { type: "request" })
       this.assertGeneration(generation)
       try {
         await receiver.waitForMessage(COMMAND_TIMEOUT_MS / 1000)
@@ -546,9 +441,9 @@ export class AirthingsClient {
       this.assertGeneration(generation)
       return decoder.decodeData(this.logger, receiver.message)
     } finally {
-      char.removeListener("data", onData)
+      char.removeListener("valuechanged", onData)
       try {
-        await unsubscribe(char)
+        await char.stopNotifications()
       } catch {
         // ignore
       }
@@ -556,7 +451,7 @@ export class AirthingsClient {
   }
 
   private async readAtomSensors(
-    byUuid: Map<string, Characteristic>,
+    byUuid: Map<string, { uuid: string, char: NodeBleGattCharacteristic }>,
     device: AirthingsDevice,
     generation: number,
   ): Promise<void> {
@@ -570,8 +465,8 @@ export class AirthingsClient {
 
     this.assertGeneration(generation)
     const connectivity = await this.fetchAtom(
-      writeCharRef,
-      notifyCharRef,
+      writeCharRef.char,
+      notifyCharRef.char,
       AtomRequestPath.CONNECTIVITY_MODE,
       generation,
     )
@@ -581,8 +476,8 @@ export class AirthingsClient {
 
     this.assertGeneration(generation)
     const latest = await this.fetchAtom(
-      writeCharRef,
-      notifyCharRef,
+      writeCharRef.char,
+      notifyCharRef.char,
       AtomRequestPath.LATEST_VALUES,
       generation,
     )
@@ -593,19 +488,14 @@ export class AirthingsClient {
     device.sensors = sensors
   }
 
-  /**
-   * collect atom notify payload until silence after the header arrives,
-   * or total timeout. more reliable than a single 100ms settle for multi-packet cbor.
-   */
   private async fetchAtom(
-    writeCharRef: Characteristic,
-    notifyCharRef: Characteristic,
+    writeCharRef: NodeBleGattCharacteristic,
+    notifyCharRef: NodeBleGattCharacteristic,
     path: AtomRequestPath,
     generation: number,
   ): Promise<SensorMap | null> {
     this.assertGeneration(generation)
     const decoder = new AtomCommandDecode(path)
-    // object holder so closure mutations stay visible to the control flow
     const state: { message: Buffer | null, lastPacketAt: number } = {
       message: null,
       lastPacketAt: 0,
@@ -620,18 +510,17 @@ export class AirthingsClient {
       }
     }
 
-    notifyCharRef.on("data", onData)
+    notifyCharRef.on("valuechanged", onData)
     try {
-      await subscribe(notifyCharRef)
+      await notifyCharRef.startNotifications()
       this.assertGeneration(generation)
-      await writeChar(writeCharRef, decoder.cmd, false)
+      await writeCharRef.writeValue(decoder.cmd, { type: "request" })
       this.assertGeneration(generation)
 
       const deadline = Date.now() + COMMAND_TIMEOUT_MS
       while (Date.now() < deadline) {
         this.assertGeneration(generation)
         if (state.message && state.message.length >= 9) {
-          // wait until no new packets for settle window
           if (Date.now() - state.lastPacketAt >= ATOM_NOTIFY_SETTLE_MS) {
             break
           }
@@ -646,9 +535,9 @@ export class AirthingsClient {
       }
       return decoder.decodeData(this.logger, state.message)
     } finally {
-      notifyCharRef.removeListener("data", onData)
+      notifyCharRef.removeListener("valuechanged", onData)
       try {
-        await unsubscribe(notifyCharRef)
+        await notifyCharRef.stopNotifications()
       } catch {
         // ignore
       }
@@ -685,7 +574,6 @@ export class AirthingsClient {
     this.mapAtomRadon(next, month, RADON_MONTH_AVG, RADON_MONTH_LEVEL)
     this.mapAtomRadon(next, sensorData[ATOM_RADON_YEAR_AVG], RADON_YEAR_AVG, RADON_YEAR_LEVEL)
 
-    // homekit exposes a single long-term average; prefer year, else month, else week
     const longTermRaw =
       sensorData[ATOM_RADON_YEAR_AVG]
       ?? month
@@ -705,14 +593,12 @@ export class AirthingsClient {
     if (raw === undefined || raw === null) {
       return
     }
-    // level always derived from bq/m³ before optional pCi conversion
     const bq = Number(raw)
     target[avgKey] = this.isMetric ? bq : bq * BQ_TO_PCI_MULTIPLIER
     target[levelKey] = getRadonLevel(bq)
   }
 
   private applyRadonUnits(sensors: SensorMap, sensorData: SensorMap): void {
-    // level always derived from bq/m³ before optional pCi conversion
     if (sensorData[RADON_1DAY_AVG] !== undefined && sensorData[RADON_1DAY_AVG] !== null) {
       const bq = Number(sensorData[RADON_1DAY_AVG])
       sensors[RADON_1DAY_LEVEL] = getRadonLevel(bq)
@@ -729,6 +615,3 @@ export class AirthingsClient {
     }
   }
 }
-
-// re-export service type for typing convenience
-export type { Service }

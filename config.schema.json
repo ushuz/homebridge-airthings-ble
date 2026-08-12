@@ -4,7 +4,7 @@
   "singular": true,
   "strictValidation": false,
   "headerDisplay": "Homebridge plugin for Airthings Wave / Corentium devices over Bluetooth LE. Protocol based on the [official Airthings BLE library](https://github.com/Airthings/airthings-ble).",
-  "footerDisplay": "Requires BlueZ and a working Bluetooth adapter. On Raspberry Pi, run Homebridge as a user in the `bluetooth` group. Radon is exposed via custom characteristics and mapped to HomeKit Air Quality.",
+  "footerDisplay": "Requires BlueZ (D-Bus) and a working Bluetooth adapter — uses node-ble, not raw HCI. On Raspberry Pi, ensure the Homebridge user can access org.bluez. Radon is exposed via custom characteristics and mapped to HomeKit Air Quality.",
   "schema": {
     "type": "object",
     "properties": {
@@ -41,6 +41,13 @@
         "minimum": 400,
         "maximum": 5000,
         "description": "HomeKit Carbon Dioxide Detected is abnormal when CO₂ is at or above this level. Devices do not expose a threshold over BLE."
+      },
+      "hciDeviceId": {
+        "title": "Bluetooth adapter ID",
+        "type": "integer",
+        "minimum": 0,
+        "default": 0,
+        "description": "BlueZ adapter index (hci0 = 0). Use the same value as other BLE plugins so they share one adapter lock around scan/connect."
       },
       "debug": {
         "title": "Debug logging",
@@ -90,7 +97,8 @@
       "items": [
         "refreshInterval",
         "scanDuration",
-        "co2AlertThreshold"
+        "co2AlertThreshold",
+        "hciDeviceId"
       ]
     },
     {

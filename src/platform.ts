@@ -8,6 +8,7 @@ import type {
   Service,
 } from "homebridge"
 import { PLATFORM_NAME, PLUGIN_NAME } from "./settings.js"
+import { resolveHciDeviceId } from "./ble/adapterLock.js"
 import { BleScanner, type DeviceFilter, type DiscoveredDevice, type ScannerConfig } from "./ble/scanner.js"
 import { AirthingsPlatformAccessory } from "./platformAccessory.js"
 import { createCustomCharacteristics, type CustomCharacteristics } from "./customCharacteristics.js"
@@ -20,6 +21,8 @@ export interface AirthingsPlatformConfig extends PlatformConfig {
   isMetric?: boolean
   /** ppm; CarbonDioxideDetected is abnormal at or above this (default 1000) */
   co2AlertThreshold?: number
+  /** noble hci adapter index (default 0); lock is shared per adapter with peer ble plugins */
+  hciDeviceId?: number
   debug?: boolean
   devices?: DeviceFilter[]
 }
@@ -31,6 +34,7 @@ export class AirthingsBlePlatform implements DynamicPlatformPlugin {
 
   public readonly accessories = new Map<string, PlatformAccessory>()
   private readonly handlers = new Map<string, AirthingsPlatformAccessory>()
+  private readonly hciDeviceId: number
   private scanner?: BleScanner
 
   constructor(
@@ -43,6 +47,9 @@ export class AirthingsBlePlatform implements DynamicPlatformPlugin {
     this.custom = createCustomCharacteristics(api, {
       isMetric: this.config.isMetric ?? true,
     })
+
+    // explicit config wins; else NOBLE_HCI_DEVICE_ID env (legacy); else 0
+    this.hciDeviceId = resolveHciDeviceId(this.config.hciDeviceId)
 
     this.log.debug("Finished initializing platform:", this.config.name ?? PLATFORM_NAME)
 
@@ -67,6 +74,7 @@ export class AirthingsBlePlatform implements DynamicPlatformPlugin {
       isMetric: this.config.isMetric ?? true,
       debug: this.config.debug ?? false,
       devices: this.config.devices ?? [],
+      hciDeviceId: this.hciDeviceId,
     }
 
     this.scanner = new BleScanner(this.log, scannerConfig)
@@ -78,7 +86,7 @@ export class AirthingsBlePlatform implements DynamicPlatformPlugin {
     } catch (err) {
       this.log.error(`Bluetooth init failed: ${String(err)}`)
       this.log.error(
-        "Ensure BlueZ is installed, the adapter is powered on, and the homebridge user is in the bluetooth group.",
+        "Ensure BlueZ is running, the adapter is powered on, and D-Bus permissions allow the homebridge user to talk to org.bluez (node-ble).",
       )
       return
     }

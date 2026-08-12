@@ -4,7 +4,7 @@ Homebridge plugin for [Airthings](https://www.airthings.com/) air quality monito
 
 Sensor protocol is ported from the official [Airthings BLE library](https://github.com/Airthings/airthings-ble) used by Home Assistant.
 
-BLE stack: [`@stoprocent/noble`](https://www.npmjs.com/package/@stoprocent/noble) (includes **armv6** prebuilds for classic Pi Zero W via `@stoprocent/bluetooth-hci-socket`).
+BLE stack: [`node-ble`](https://www.npmjs.com/package/node-ble) (BlueZ over D-Bus, pure JavaScript — no native HCI bindings). **Linux only** (Raspberry Pi / Homebridge OS).
 
 ## Supported devices
 
@@ -23,25 +23,19 @@ BLE stack: [`@stoprocent/noble`](https://www.npmjs.com/package/@stoprocent/noble
 | --- | --- |
 | Homebridge | 1.8.5+ (2.x also supported) |
 | Node.js | 20.18.0+ (or 22.x) |
-| OS | Linux (Raspberry Pi), macOS |
+| OS | Linux with BlueZ (Raspberry Pi) |
 
 ### Raspberry Pi / Linux Bluetooth
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y bluetooth bluez libbluetooth-dev libudev-dev
+sudo apt-get install -y bluetooth bluez
 sudo systemctl enable --now bluetooth
-sudo usermod -aG bluetooth homebridge   # or the user that runs homebridge
-sudo setcap cap_net_raw+eip $(eval readlink -f $(which node))
 ```
 
-Reboot (or re-login) so group membership applies.
+`node-ble` talks to BlueZ on the system D-Bus. Ensure the Homebridge user can use `org.bluez` (membership in the `bluetooth` group, or a D-Bus policy such as the one in the [node-ble README](https://github.com/chrvadala/node-ble#provide-permissions)).
 
-Native HCI bindings usually install from **prebuilt** binaries (including **armv6l** / Pi Zero W). Only if that fails:
-
-```bash
-sudo apt-get install -y build-essential python3
-```
+No `setcap` / raw HCI capabilities are required (unlike noble).
 
 ## Install
 
@@ -65,6 +59,7 @@ Example `config.json` platform block:
   "scanDuration": 20,
   "isMetric": true,
   "co2AlertThreshold": 1000,
+  "hciDeviceId": 0,
   "debug": false,
   "devices": []
 }
@@ -76,8 +71,9 @@ Example `config.json` platform block:
 | `scanDuration` | `20` | Seconds to scan at startup. |
 | `isMetric` | `true` | Radon in Bq/m³ when true, pCi/L when false. |
 | `co2AlertThreshold` | `1000` | ppm; HomeKit CO₂ Detected is abnormal at or above this. (Not provided over BLE by the device.) |
+| `hciDeviceId` | `0` | BlueZ adapter index (`hci0`). Match other BLE plugins for shared locking. |
 | `debug` | `false` | Verbose BLE logs. |
-| `devices` | `[]` | Optional filter list. Empty = auto-discover all nearby Airthings sensors. |
+| `devices` | `[]` | Optional filter list. Empty = auto-discover nearby Airthings sensors by manufacturer data. |
 
 ### Optional device filter
 
@@ -94,53 +90,12 @@ Example `config.json` platform block:
 ]
 ```
 
-Serial numbers come from BLE manufacturer data (same as the Airthings app / packaging). On macOS, prefer serial over address (addresses are often UUIDs).
+Serial numbers come from BLE manufacturer data (same as the Airthings app / packaging).
+
+### Sharing the adapter with other BLE plugins
+
+Both this plugin and `@ushuz/homebridge-govee-ble` use **node-ble** (BlueZ D-Bus), so they no longer fight over exclusive raw HCI sockets. They still take a short-lived directory lock (`$TMPDIR/homebridge-ble-hci{N}.lock/`) around scan/connect so only one plugin drives the radio at a time. Set the same `hciDeviceId` on both.
 
 ## HomeKit services
 
-Each device is one accessory. Services are created from sensors the device reports:
-
-| Sensor | HomeKit |
-| --- | --- |
-| Temperature | Temperature Sensor |
-| Humidity | Humidity Sensor |
-| CO₂ | Carbon Dioxide Sensor — **Level (ppm)** + **Detected** (alert) |
-| Battery | Battery |
-| Illuminance / lux | Light Sensor |
-| CO₂ (ppm), VOC, radon, pressure | Air Quality Sensor (+ custom characteristics) |
-
-CO₂ **Level** is the ppm reading. **Detected** flips abnormal when ppm ≥ `co2AlertThreshold` (Homebridge config; devices do not expose a threshold over BLE). Use Level for charts and Detected for HomeKit automations/alerts.
-
-Radon short/long-term averages use custom characteristics on the Air Quality service (HomeKit has no native radon type). Overall Air Quality is derived from radon level thresholds from the official SDK (good &lt; 100, fair &lt; 150, poor ≥ 150 Bq/m³), with CO₂/VOC fallbacks.
-
-## How it works
-
-1. Scans for BLE advertisements with Airthings company ID `0x0334`.
-2. Connects to each device (serialized — one connection at a time for single-adapter Pis).
-3. Reads GATT characteristics / command notify paths matching [airthings-ble](https://github.com/Airthings/airthings-ble).
-4. Updates HomeKit characteristics, then disconnects until the next interval.
-
-Each poll logs lines like `[sync] … starting` / `[sync] … ok in …ms` / `[sync] … failed` in the Homebridge log.
-
-### BLE conflicts (e.g. Govee)
-
-Only one Node process should own the Bluetooth HCI adapter. If another plugin (common: **Govee BLE**) also uses noble/HCI in the same Homebridge instance, scans/connects can fail and accessories may go unresponsive. Prefer:
-
-- Put this plugin (and/or Govee BLE) on a **child bridge**, or
-- Disable BLE for the other plugin if it can use cloud/LAN instead.
-
-## Development
-
-```bash
-git clone https://github.com/ushuz/homebridge-airthings-ble.git
-cd homebridge-airthings-ble
-npm install
-npm test
-npm run build
-```
-
-## License
-
-MIT
-
-Protocol reference: [Airthings/airthings-ble](https://github.com/Airthings/airthings-ble) (MIT).
+See the plugin UI / accessory characteristics for temperature, humidity, CO₂, VOC, pressure, radon, battery, and air quality mappings.

@@ -47,8 +47,8 @@
     "watch": "npm run build && npm link && nodemon"
   },
   "dependencies": {
-    "@stoprocent/noble": "^2.7.1",
-    "cbor": "^10.0.3"
+    "cbor": "^10.0.3",
+    "node-ble": "^1.13.0"
   },
   "devDependencies": {
     "@eslint/js": "^9.21.0",
