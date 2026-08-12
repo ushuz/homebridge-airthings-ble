@@ -89,6 +89,8 @@ export class BleScanner {
   private readonly config: ScannerConfig
   private readonly client: AirthingsClient
   private readonly devices = new Map<string, DiscoveredDevice>()
+  /** serials found via advertisement during the current discover() call */
+  private readonly foundViaAdvertisement = new Set<string>()
   /** addresses seen via service-uuid path before serial is known */
   private readonly pendingAddresses = new Set<string>()
   readonly lastData = new Map<string, AirthingsDevice>()
@@ -166,31 +168,60 @@ export class BleScanner {
   }
 
   async discover(options?: { clear?: boolean }): Promise<DiscoveredDevice[]> {
-    return this.withAdapterLock(() => this.discoverLocked(options))
-  }
-
-  private async discoverLocked(options?: { clear?: boolean }): Promise<DiscoveredDevice[]> {
     const clear = options?.clear ?? true
     if (clear) {
       this.devices.clear()
       this.pendingAddresses.clear()
     }
+    this.foundViaAdvertisement.clear()
 
     const { adapter } = this.requireBus()
     this.log.info(`Scanning for Airthings devices (${this.config.scanDurationSec}s)...`)
-    const startedHere = await ensureDiscovery(adapter)
-    try {
-      await sleep(this.config.scanDurationSec * 1000)
-      const addresses = await adapter.devices()
-      for (const address of addresses) {
-        // do not require rssi — bluez often clears it between ads and that
-        // filtered out live airthings devices on pi zero
-        await this.inspectAdvertisement(address)
-      }
-    } finally {
-      // stop only if we started — peers may still need discovery
-      await stopDiscoveryIfStarted(adapter, startedHere)
+
+    // inspect while discovery is active — bluez often clears ManufacturerData
+    // after StopDiscovery. only walk each bluez address once (plus known targets
+    // every second) so the shared lock is not held for minutes on pi zero.
+    const knownTargets = new Set<string>()
+    for (const d of this.config.devices) {
+      if (d.address) knownTargets.add(normalizeBleAddress(d.address))
     }
+    for (const d of this.devices.values()) {
+      knownTargets.add(normalizeBleAddress(d.address))
+    }
+
+    await this.withAdapterLock(async () => {
+      const startedHere = await ensureDiscovery(adapter)
+      const inspected = new Set<string>()
+      try {
+        const deadline = Date.now() + this.config.scanDurationSec * 1000
+        while (Date.now() < deadline) {
+          if (this.foundAllConfiguredViaAdvertisement()) {
+            break
+          }
+          let addresses: string[] = []
+          try {
+            addresses = await adapter.devices()
+          } catch {
+            addresses = []
+          }
+          const fresh = addresses.filter((a) => !inspected.has(normalizeBleAddress(a)))
+          for (const a of fresh) {
+            inspected.add(normalizeBleAddress(a))
+          }
+          // re-check known targets every loop (mfg may appear late)
+          const batch = [
+            ...fresh,
+            ...[...knownTargets].filter((a) => !fresh.some((f) => normalizeBleAddress(f) === a)),
+          ]
+          await mapPool(batch.slice(0, 24), 8, async (address) => {
+            await this.inspectAdvertisement(address)
+          })
+          await sleep(750)
+        }
+      } finally {
+        await stopDiscoveryIfStarted(adapter, startedHere)
+      }
+    })
 
     for (const filter of this.config.devices) {
       if (filter.address) {
@@ -225,6 +256,8 @@ export class BleScanner {
   }
 
   private async inspectAdvertisement(address: string): Promise<void> {
+    const addressConfigured = this.matchesConfiguredAddress(address)
+
     let device: NodeBleDevice
     try {
       device = await this.getCachedDevice(address)
@@ -239,8 +272,12 @@ export class BleScanner {
       mfg = null
     }
 
+    // most bluez cache entries have no manufacturer data — skip fast
     const payloads = manufacturerPayloads(mfg)
-    const addressConfigured = this.matchesConfiguredAddress(address)
+    if (payloads.length === 0 && !addressConfigured) {
+      return
+    }
+
     let serial: string | null = null
     for (const payload of payloads) {
       serial = parseSerial(payload)
@@ -323,6 +360,7 @@ export class BleScanner {
 
     this.devices.set(id, device)
     this.pendingAddresses.delete(normalizeBleAddress(address))
+    this.foundViaAdvertisement.add(normalizeSerial(serial))
 
     if (isNew) {
       this.onDiscovered?.(device)
@@ -353,6 +391,30 @@ export class BleScanner {
     return this.config.devices.some(
       (d) => d.address && normalizeBleAddress(d.address) === addr,
     )
+  }
+
+  /**
+   * true when every configured serial has been seen in ads this scan.
+   * ignores seedKnownDevice entries so we do not abort the radio scan early.
+   */
+  private foundAllConfiguredViaAdvertisement(): boolean {
+    if (this.config.devices.length === 0) {
+      return this.foundViaAdvertisement.size > 0
+    }
+    return this.config.devices.every((filter) => {
+      if (filter.serialNumber !== undefined) {
+        return this.foundViaAdvertisement.has(normalizeSerial(filter.serialNumber))
+      }
+      if (filter.address) {
+        const key = normalizeBleAddress(filter.address)
+        return [...this.devices.values()].some(
+          (d) =>
+            normalizeBleAddress(d.address) === key
+            && this.foundViaAdvertisement.has(normalizeSerial(d.serialNumber)),
+        )
+      }
+      return true
+    })
   }
 
   startPolling(options?: { skipInitialRescan?: boolean }): void {
@@ -462,19 +524,28 @@ export class BleScanner {
 
   private async getBleDevice(address: string): Promise<NodeBleDevice> {
     const key = normalizeBleAddress(address)
+    const formatted = formatBleAddress(address)
+    const { adapter } = this.requireBus()
+    // always run le discovery while waiting — bluez may not have the Device1 node yet
+    const started = await ensureDiscovery(adapter)
     try {
-      return await this.getCachedDevice(address)
-    } catch {
-      // wait briefly with discovery if not in cache
-      const { adapter } = this.requireBus()
-      const started = await ensureDiscovery(adapter)
-      try {
-        const device = await adapter.waitDevice(formatBleAddress(address), 15_000, 500)
-        this.bleDevices.set(key, device)
-        return device
-      } finally {
-        await stopDiscoveryIfStarted(adapter, started)
+      const deadline = Date.now() + 30_000
+      let lastErr: unknown
+      while (Date.now() < deadline) {
+        try {
+          const device = await adapter.getDevice(formatted)
+          this.bleDevices.set(key, device)
+          return device
+        } catch (err) {
+          lastErr = err
+          await sleep(500)
+        }
       }
+      throw lastErr instanceof Error
+        ? lastErr
+        : new Error(`device ${address} not found during discovery`)
+    } finally {
+      await stopDiscoveryIfStarted(adapter, started)
     }
   }
 
@@ -603,4 +674,48 @@ export class BleScanner {
   getDiscovered(): DiscoveredDevice[] {
     return [...this.devices.values()]
   }
+
+  /**
+   * re-register a device known from homebridge cache / prior discovery.
+   * used when a scan misses manufacturer ads so poll can still connect by address.
+   */
+  seedKnownDevice(input: {
+    serialNumber: string
+    address: string
+    displayName?: string
+  }): DiscoveredDevice {
+    // register without counting as advertisement-found
+    const serial = normalizeSerial(input.serialNumber)
+    const address = normalizeBleAddress(input.address)
+    const id = serial
+    const device: DiscoveredDevice = {
+      id,
+      address,
+      serialNumber: serial,
+      displayName: input.displayName || `Airthings ${serial}`,
+    }
+    this.devices.set(id, device)
+    return device
+  }
 }
+
+/** run async work over items with a concurrency limit */
+async function mapPool<T>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T) => Promise<void>,
+): Promise<void> {
+  if (items.length === 0) {
+    return
+  }
+  const limit = Math.max(1, concurrency)
+  let index = 0
+  const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (index < items.length) {
+      const i = index++
+      await worker(items[i])
+    }
+  })
+  await Promise.all(runners)
+}
+

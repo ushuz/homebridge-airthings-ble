@@ -111,6 +111,7 @@ export class AirthingsBlePlatform implements DynamicPlatformPlugin {
     // never unregister accessories just because a scan missed them.
     // ble sensors are often offline or out of range at startup; removing them
     // would drop them from homekit without user action.
+    // re-seed the scanner by address so poll can still connect without mfg ads.
     for (const [uuid, accessory] of this.accessories) {
       if (seenUuids.has(uuid)) {
         continue
@@ -129,16 +130,27 @@ export class AirthingsBlePlatform implements DynamicPlatformPlugin {
         accessory.displayName,
       )
 
+      if (ctx.serialNumber && ctx.address && this.scanner) {
+        const seeded = this.scanner.seedKnownDevice({
+          serialNumber: ctx.serialNumber,
+          address: ctx.address,
+          displayName: ctx.displayName ?? accessory.displayName,
+        })
+        this.log.info(
+          `Seeded ${seeded.displayName} sn=${seeded.serialNumber} address=${seeded.address} for poll`,
+        )
+      }
+
       const key = this.accessoryHandlerKey(ctx)
       if (key && !this.handlers.has(key)) {
         this.handlers.set(key, new AirthingsPlatformAccessory(this, accessory))
       }
     }
 
-    // skip first re-scan only when launch already found devices to poll.
-    // empty or failed discovery re-scans immediately (devices often miss short windows).
+    // skip first re-scan when we already have devices to poll (from ads or cache seed)
+    const haveDevices = this.scanner.getDiscovered().length > 0
     this.scanner.startPolling({
-      skipInitialRescan: initialDiscoverOk && discovered.length > 0,
+      skipInitialRescan: haveDevices,
     })
   }
 
