@@ -183,10 +183,8 @@ export class BleScanner {
       await sleep(this.config.scanDurationSec * 1000)
       const addresses = await adapter.devices()
       for (const address of addresses) {
-        // bluez keeps stale Device1 nodes; rssi is only set while advertising
-        if (!(await this.isCurrentlyAdvertising(address))) {
-          continue
-        }
+        // do not require rssi — bluez often clears it between ads and that
+        // filtered out live airthings devices on pi zero
         await this.inspectAdvertisement(address)
       }
     } finally {
@@ -224,17 +222,6 @@ export class BleScanner {
     const device = await adapter.getDevice(formatBleAddress(address))
     this.bleDevices.set(key, device)
     return device
-  }
-
-  /** true when bluez reports a live rssi (device is advertising now) */
-  private async isCurrentlyAdvertising(address: string): Promise<boolean> {
-    try {
-      const device = await this.getCachedDevice(address)
-      const rssi = await device.getRSSI()
-      return rssi !== null && rssi !== undefined && String(rssi) !== ""
-    } catch {
-      return false
-    }
   }
 
   private async inspectAdvertisement(address: string): Promise<void> {
