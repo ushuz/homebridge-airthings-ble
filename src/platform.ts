@@ -92,11 +92,9 @@ export class AirthingsBlePlatform implements DynamicPlatformPlugin {
     }
 
     let discovered: DiscoveredDevice[] = []
-    let initialDiscoverOk = true
     try {
       discovered = await this.scanner.discover()
     } catch (err) {
-      initialDiscoverOk = false
       this.log.error(`Device discovery failed: ${String(err)}`)
       this.log.warn("Continuing with cached accessories; will re-scan on the next poll cycle")
     }
