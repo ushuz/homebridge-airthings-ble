@@ -175,6 +175,11 @@ export class AirthingsClient {
   private readonly maxAttempts: number
   /** generation counter so timed-out attempts ignore late results */
   private updateGeneration = 0
+  /** reuse gatt chars — remapping each poll stacks dbus PropertiesChanged listeners */
+  private readonly charCache = new WeakMap<
+    NodeBleDevice,
+    Map<string, { uuid: string, char: NodeBleGattCharacteristic }>
+  >()
 
   constructor(options: ClientOptions) {
     this.logger = options.logger
@@ -196,6 +201,7 @@ export class AirthingsClient {
         return await this.updateOnceWithTimeout(device, generation)
       } catch (err) {
         lastError = err
+        this.charCache.delete(device)
         this.logger.debug(`Update attempt ${attempt + 1} failed: ${String(err)}`)
         await disconnectDevice(device)
         await sleep(300)
@@ -254,7 +260,7 @@ export class AirthingsClient {
     await connectDevice(device)
     this.assertGeneration(generation)
     try {
-      const byUuid = await mapAllCharacteristics(device)
+      const byUuid = await this.characteristicsFor(device)
       this.assertGeneration(generation)
 
       const address = await device.getAddress().catch(() => "")
@@ -287,6 +293,18 @@ export class AirthingsClient {
         await disconnectDevice(device)
       }
     }
+  }
+
+  private async characteristicsFor(
+    device: NodeBleDevice,
+  ): Promise<Map<string, { uuid: string, char: NodeBleGattCharacteristic }>> {
+    const cached = this.charCache.get(device)
+    if (cached && cached.size > 0) {
+      return cached
+    }
+    const byUuid = await mapAllCharacteristics(device)
+    this.charCache.set(device, byUuid)
+    return byUuid
   }
 
   private assertGeneration(generation: number): void {

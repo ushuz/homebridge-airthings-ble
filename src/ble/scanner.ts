@@ -6,6 +6,7 @@ import { productName } from "../airthings/deviceType.js"
 import { withBleAdapterLock } from "./adapterLock.js"
 import {
   ensureDiscovery,
+  forgetCachedDevice,
   formatBleAddress,
   manufacturerPayloads,
   normalizeBleAddress,
@@ -524,6 +525,16 @@ export class BleScanner {
 
   private async getBleDevice(address: string): Promise<NodeBleDevice> {
     const key = normalizeBleAddress(address)
+    const cached = this.bleDevices.get(key)
+    if (cached) {
+      try {
+        await cached.getAddress()
+        return cached
+      } catch {
+        this.bleDevices.delete(key)
+        forgetCachedDevice(this.requireBus().adapter, address)
+      }
+    }
     const formatted = formatBleAddress(address)
     const { adapter } = this.requireBus()
     // always run le discovery while waiting — bluez may not have the Device1 node yet
