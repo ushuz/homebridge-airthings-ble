@@ -73,7 +73,7 @@ Example `config.json` platform block:
 | `co2AlertThreshold` | `1000` | ppm; HomeKit CO₂ Detected is abnormal at or above this. (Not provided over BLE by the device.) |
 | `hciDeviceId` | `0` | BlueZ adapter index (`hci0`). Match other BLE plugins for shared locking. |
 | `debug` | `false` | Verbose BLE logs. |
-| `devices` | `[]` | Optional filter list. Empty = auto-discover nearby Airthings sensors by manufacturer data. |
+| `devices` | `[]` | Optional allow-list. `serialNumber` is the accessory identity; `address` is only used to find the radio. Empty = auto-discover nearby Airthings sensors. |
 
 ### Optional device filter
 

@@ -2,7 +2,7 @@ import type { Logging } from "homebridge"
 import { MFCT_ID } from "../airthings/const.js"
 import { AirthingsClient, UnsupportedDeviceError } from "../airthings/client.js"
 import type { AirthingsDevice } from "../airthings/types.js"
-import { productName } from "../airthings/deviceType.js"
+import { AirthingsDeviceType, productName } from "../airthings/deviceType.js"
 import { withBleAdapterLock } from "./adapterLock.js"
 import {
   ensureDiscovery,
@@ -79,6 +79,46 @@ export function parseSerial(
 
 export function normalizeSerial(value: unknown): string {
   return String(value ?? "").trim()
+}
+
+const MODEL_PREFIXES = new Set(
+  (Object.values(AirthingsDeviceType) as string[]).filter((value) => /^\d{4}$/.test(value)),
+)
+
+/**
+ * true when two serials are the same physical airthings device.
+ * manufacturer ads use 10 digits (4-digit model + 6-digit unique);
+ * the gatt Serial Number characteristic on atom devices is often just the unique part.
+ */
+export function serialsReferToSameDevice(a: string, b: string): boolean {
+  const left = normalizeSerial(a)
+  const right = normalizeSerial(b)
+  if (!left || !right) {
+    return false
+  }
+  if (left === right) {
+    return true
+  }
+  const [long, short] = left.length >= right.length ? [left, right] : [right, left]
+  if (long.length !== 10 || !/^\d{10}$/.test(long) || !long.endsWith(short) || short.length < 4) {
+    return false
+  }
+  return MODEL_PREFIXES.has(long.slice(0, 4))
+}
+
+/** prefer the 10-digit manufacturer serial over a short gatt serial */
+export function preferSerial(a: string, b: string): string {
+  const left = normalizeSerial(a)
+  const right = normalizeSerial(b)
+  if (!left) return right
+  if (!right) return left
+  if (left === right) return left
+  if (serialsReferToSameDevice(left, right)) {
+    return left.length >= right.length ? left : right
+  }
+  if (/^\d{10}$/.test(left) && !/^\d{10}$/.test(right)) return left
+  if (/^\d{10}$/.test(right) && !/^\d{10}$/.test(left)) return right
+  return left.length >= right.length ? left : right
 }
 
 /**
@@ -344,26 +384,92 @@ export class BleScanner {
     address: string,
     localName: string | null,
   ): DiscoveredDevice {
-    const id = serial
-    const isNew = !this.devices.has(id)
+    return this.upsertDevice(serial, address, localName, { countAsAdvertisement: true })
+  }
+
+  private findDeviceByAddress(address: string): DiscoveredDevice | undefined {
+    const addr = normalizeBleAddress(address)
+    return [...this.devices.values()].find((d) => normalizeBleAddress(d.address) === addr)
+  }
+
+  private configuredSerialFor(serial: string, address: string): string | undefined {
+    const addr = normalizeBleAddress(address)
+    const incoming = normalizeSerial(serial)
+    for (const d of this.config.devices) {
+      if (d.serialNumber === undefined) {
+        continue
+      }
+      const configured = normalizeSerial(d.serialNumber)
+      if (d.address && normalizeBleAddress(d.address) === addr) {
+        return configured
+      }
+      if (configured === incoming) {
+        return configured
+      }
+    }
+    return undefined
+  }
+
+  /**
+   * one discovered device per ble address.
+   * a configured serialNumber is the identity; otherwise prefer the 10-digit mfg serial.
+   */
+  private upsertDevice(
+    serial: string,
+    address: string,
+    localName: string | null,
+    options?: { countAsAdvertisement?: boolean },
+  ): DiscoveredDevice {
+    const addr = normalizeBleAddress(address)
+    const incoming = normalizeSerial(serial)
+    const configured = this.configuredSerialFor(incoming, addr)
+    const existing = this.findDeviceByAddress(addr)
+
+    let preferred = incoming
+    if (configured) {
+      preferred = configured
+    } else if (existing) {
+      preferred = preferSerial(incoming, existing.serialNumber)
+    }
+
     const configuredName = this.config.devices.find(
       (d) =>
-        (d.serialNumber !== undefined && normalizeSerial(d.serialNumber) === normalizeSerial(serial))
-        || (d.address && normalizeBleAddress(d.address) === normalizeBleAddress(address)),
+        (d.serialNumber !== undefined && normalizeSerial(d.serialNumber) === preferred)
+        || (d.address && normalizeBleAddress(d.address) === addr),
     )?.name
 
     const device: DiscoveredDevice = {
-      id,
-      address: normalizeBleAddress(address),
-      serialNumber: serial,
-      displayName: configuredName || localName || `Airthings ${serial}`,
+      id: preferred,
+      address: addr,
+      serialNumber: preferred,
+      displayName: configuredName || localName || existing?.displayName || `Airthings ${preferred}`,
     }
 
-    this.devices.set(id, device)
-    this.pendingAddresses.delete(normalizeBleAddress(address))
-    this.foundViaAdvertisement.add(normalizeSerial(serial))
+    if (existing && existing.id !== preferred) {
+      this.log.info(
+        `Merging ${existing.serialNumber} into ${preferred} at ${addr}`,
+      )
+      this.devices.delete(existing.id)
+      const prev = this.lastData.get(existing.id)
+      this.lastData.delete(existing.id)
+      if (prev) {
+        this.lastData.set(preferred, prev)
+      }
+    }
 
-    if (isNew) {
+    const isNewAddress = !existing
+    this.devices.set(preferred, device)
+    this.pendingAddresses.delete(addr)
+
+    if (options?.countAsAdvertisement) {
+      this.foundViaAdvertisement.add(preferred)
+      this.foundViaAdvertisement.add(incoming)
+      if (configured) {
+        this.foundViaAdvertisement.add(configured)
+      }
+    }
+
+    if (isNewAddress && options?.countAsAdvertisement) {
       this.onDiscovered?.(device)
     }
     return device
@@ -495,12 +601,14 @@ export class BleScanner {
         this.pendingAddresses.delete(normalizeBleAddress(addr))
         return
       }
-      if (!this.matchesFilter(serial, addr)) {
-        this.log.debug(`Resolved ${serial} at ${addr} but filtered out by config`)
+      const configured = this.configuredSerialFor(serial, addr)
+      const resolved = configured ? preferSerial(configured, serial) : serial
+      if (!this.matchesFilter(resolved, addr)) {
+        this.log.debug(`Resolved ${resolved} at ${addr} but filtered out by config`)
         this.pendingAddresses.delete(normalizeBleAddress(addr))
         return
       }
-      const device = this.registerDevice(serial, addr, data.name ?? null)
+      const device = this.registerDevice(resolved, addr, data.name ?? null)
       this.lastData.set(device.id, data)
       this.onUpdate?.(device.id, data)
     } catch (err) {
@@ -696,17 +804,11 @@ export class BleScanner {
     displayName?: string
   }): DiscoveredDevice {
     // register without counting as advertisement-found
-    const serial = normalizeSerial(input.serialNumber)
-    const address = normalizeBleAddress(input.address)
-    const id = serial
-    const device: DiscoveredDevice = {
-      id,
-      address,
-      serialNumber: serial,
-      displayName: input.displayName || `Airthings ${serial}`,
-    }
-    this.devices.set(id, device)
-    return device
+    return this.upsertDevice(
+      input.serialNumber,
+      input.address,
+      input.displayName ?? null,
+    )
   }
 }
 

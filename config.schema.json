@@ -57,19 +57,19 @@
       "devices": {
         "title": "Devices",
         "type": "array",
-        "description": "Optional. Restrict to these devices by serial number or Bluetooth address. Leave empty to auto-discover all nearby Airthings sensors.",
+        "description": "Optional. Restrict to these devices. Serial number is the HomeKit identity; Bluetooth address is only used to find the device. Leave empty to auto-discover all nearby Airthings sensors.",
         "items": {
           "type": "object",
           "properties": {
             "serialNumber": {
               "title": "Serial number",
               "type": "string",
-              "description": "Airthings serial number from manufacturer data (digits)."
+              "description": "Airthings serial number from the packaging / manufacturer data. This is the accessory identity."
             },
             "address": {
               "title": "Bluetooth address",
               "type": "string",
-              "description": "MAC address (Linux) or UUID (macOS), e.g. aa:bb:cc:dd:ee:ff."
+              "description": "MAC address used to find the device when advertisements omit the serial, e.g. aa:bb:cc:dd:ee:ff. Not a second identity."
             },
             "name": {
               "title": "Display name",

@@ -9,10 +9,25 @@ import type {
 } from "homebridge"
 import { PLATFORM_NAME, PLUGIN_NAME } from "./settings.js"
 import { resolveHciDeviceId } from "./ble/adapterLock.js"
-import { BleScanner, type DeviceFilter, type DiscoveredDevice, type ScannerConfig } from "./ble/scanner.js"
+import { normalizeBleAddress } from "./ble/nodeBle.js"
+import {
+  BleScanner,
+  normalizeSerial,
+  preferSerial,
+  serialsReferToSameDevice,
+  type DeviceFilter,
+  type DiscoveredDevice,
+  type ScannerConfig,
+} from "./ble/scanner.js"
 import { AirthingsPlatformAccessory } from "./platformAccessory.js"
 import { createCustomCharacteristics, type CustomCharacteristics } from "./customCharacteristics.js"
 import type { AirthingsDevice } from "./airthings/types.js"
+
+interface AccessoryDeviceContext {
+  serialNumber?: string
+  address?: string
+  displayName?: string
+}
 
 export interface AirthingsPlatformConfig extends PlatformConfig {
   name?: string
@@ -91,6 +106,8 @@ export class AirthingsBlePlatform implements DynamicPlatformPlugin {
       return
     }
 
+    this.removeDuplicateAccessories()
+
     let discovered: DiscoveredDevice[] = []
     try {
       discovered = await this.scanner.discover()
@@ -115,11 +132,34 @@ export class AirthingsBlePlatform implements DynamicPlatformPlugin {
         continue
       }
 
-      const ctx = accessory.context.device as {
-        serialNumber?: string
-        address?: string
-        displayName?: string
+      const ctx = accessory.context.device as AccessoryDeviceContext
+      const devicesConfigured = (this.config.devices ?? []).length > 0
+      if (devicesConfigured && !this.isConfiguredDevice(ctx)) {
+        this.log.warn(
+          "Removing cached accessory that is not in the configured device list:",
+          accessory.displayName,
+          ctx.serialNumber ?? "?",
+        )
+        this.unregisterAccessory(accessory)
+        continue
       }
+
+      if (ctx.address && this.scanner) {
+        const addr = normalizeBleAddress(ctx.address)
+        const already = this.scanner.getDiscovered().some(
+          (d) => normalizeBleAddress(d.address) === addr,
+        )
+        if (already) {
+          this.log.warn(
+            "Removing cached accessory with the same address as a discovered device:",
+            accessory.displayName,
+            ctx.serialNumber ?? "?",
+          )
+          this.unregisterAccessory(accessory)
+          continue
+        }
+      }
+
       const configured = this.isConfiguredDevice(ctx)
       this.log.warn(
         configured
@@ -155,7 +195,7 @@ export class AirthingsBlePlatform implements DynamicPlatformPlugin {
   /** register a newly discovered device or restore from homebridge cache */
   private registerOrRestore(device: DiscoveredDevice): string {
     const uuid = this.api.hap.uuid.generate(`airthings-ble:${device.serialNumber}`)
-    const existing = this.accessories.get(uuid)
+    const existing = this.accessories.get(uuid) ?? this.findAccessoryForDevice(device)
 
     if (existing) {
       if (!this.handlers.has(device.serialNumber)) {
@@ -176,7 +216,7 @@ export class AirthingsBlePlatform implements DynamicPlatformPlugin {
           displayName: device.displayName,
         }
       }
-      return uuid
+      return existing.UUID
     }
 
     this.log.info("Adding accessory:", device.displayName)
@@ -190,6 +230,85 @@ export class AirthingsBlePlatform implements DynamicPlatformPlugin {
     this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory])
     this.accessories.set(uuid, accessory)
     return uuid
+  }
+
+  /** drop extra accessories that share a ble address (short gatt serial vs mfg serial) */
+  private removeDuplicateAccessories(): void {
+    const groups = new Map<string, PlatformAccessory[]>()
+    for (const accessory of this.accessories.values()) {
+      const ctx = accessory.context.device as AccessoryDeviceContext | undefined
+      if (!ctx?.address) {
+        continue
+      }
+      const key = normalizeBleAddress(ctx.address)
+      const list = groups.get(key) ?? []
+      list.push(accessory)
+      groups.set(key, list)
+    }
+
+    for (const [address, group] of groups) {
+      if (group.length < 2) {
+        continue
+      }
+      const keep = this.pickCanonicalAccessory(group)
+      const keepCtx = keep.context.device as AccessoryDeviceContext
+      for (const accessory of group) {
+        if (accessory.UUID === keep.UUID) {
+          continue
+        }
+        const ctx = accessory.context.device as AccessoryDeviceContext
+        this.log.warn(
+          `Removing duplicate accessory ${accessory.displayName}`
+          + ` sn=${ctx.serialNumber ?? "?"} address=${address}`
+          + ` (keeping sn=${keepCtx.serialNumber ?? "?"})`,
+        )
+        this.unregisterAccessory(accessory)
+      }
+    }
+  }
+
+  private pickCanonicalAccessory(group: PlatformAccessory[]): PlatformAccessory {
+    const configuredSerials = new Set(
+      (this.config.devices ?? [])
+        .filter((d) => d.serialNumber !== undefined)
+        .map((d) => normalizeSerial(d.serialNumber)),
+    )
+    return group.reduce((best, accessory) => {
+      const bestSn = normalizeSerial(
+        (best.context.device as AccessoryDeviceContext)?.serialNumber,
+      )
+      const accSn = normalizeSerial(
+        (accessory.context.device as AccessoryDeviceContext)?.serialNumber,
+      )
+      if (configuredSerials.has(accSn) && !configuredSerials.has(bestSn)) {
+        return accessory
+      }
+      if (configuredSerials.has(bestSn) && !configuredSerials.has(accSn)) {
+        return best
+      }
+      return preferSerial(bestSn, accSn) === accSn ? accessory : best
+    })
+  }
+
+  private findAccessoryForDevice(device: DiscoveredDevice): PlatformAccessory | undefined {
+    const addr = normalizeBleAddress(device.address)
+    for (const accessory of this.accessories.values()) {
+      const ctx = accessory.context.device as AccessoryDeviceContext | undefined
+      if (ctx?.address && normalizeBleAddress(ctx.address) === addr) {
+        return accessory
+      }
+    }
+    return undefined
+  }
+
+  private unregisterAccessory(accessory: PlatformAccessory): void {
+    const ctx = accessory.context.device as AccessoryDeviceContext | undefined
+    this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory])
+    this.accessories.delete(accessory.UUID)
+    const key = ctx ? this.accessoryHandlerKey(ctx) : undefined
+    if (key) {
+      this.handlers.delete(key)
+    }
   }
 
   /** stable handler map key: serial when present, else normalized address */
@@ -206,7 +325,10 @@ export class AirthingsBlePlatform implements DynamicPlatformPlugin {
     return undefined
   }
 
-  /** true if accessory matches an entry in the optional devices filter (serial or address) */
+  /**
+   * true if accessory is one of the configured devices.
+   * serialNumber is the identity when present; address is only a locator.
+   */
   private isConfiguredDevice(ctx: {
     serialNumber?: string
     address?: string
@@ -215,20 +337,14 @@ export class AirthingsBlePlatform implements DynamicPlatformPlugin {
     if (devices.length === 0) {
       return false
     }
-    const address = ctx.address
-      ? ctx.address.toLowerCase().replace(/-/g, "").replace(/:/g, "")
-      : undefined
+    const serial = ctx.serialNumber ? normalizeSerial(ctx.serialNumber) : ""
+    const address = ctx.address ? normalizeBleAddress(ctx.address) : ""
     return devices.some((d) => {
-      if (
-        d.serialNumber !== undefined
-        && ctx.serialNumber
-        && String(d.serialNumber).trim() === String(ctx.serialNumber).trim()
-      ) {
-        return true
+      if (d.serialNumber !== undefined) {
+        return serial !== "" && normalizeSerial(d.serialNumber) === serial
       }
       if (d.address && address) {
-        const configured = d.address.toLowerCase().replace(/-/g, "").replace(/:/g, "")
-        return configured === address
+        return normalizeBleAddress(d.address) === address
       }
       return false
     })
@@ -238,6 +354,15 @@ export class AirthingsBlePlatform implements DynamicPlatformPlugin {
     let handler = this.handlers.get(id)
     if (!handler && device.identifier) {
       handler = this.handlers.get(device.identifier)
+    }
+    if (!handler) {
+      for (const [key, candidate] of this.handlers) {
+        if (serialsReferToSameDevice(key, id)
+          || (device.identifier && serialsReferToSameDevice(key, device.identifier))) {
+          handler = candidate
+          break
+        }
+      }
     }
     if (handler) {
       handler.update(device)
