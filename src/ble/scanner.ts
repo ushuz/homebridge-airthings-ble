@@ -5,13 +5,14 @@ import type { AirthingsDevice } from "../airthings/types.js"
 import { AirthingsDeviceType, productName } from "../airthings/deviceType.js"
 import { withBleAdapterLock } from "./adapterLock.js"
 import {
-  ensureDiscovery,
+  disposeDevice,
   forgetCachedDevice,
   formatBleAddress,
   manufacturerPayloads,
   normalizeBleAddress,
   openBleBus,
-  stopDiscoveryIfStarted,
+  stopOwnedDiscovery,
+  usingDiscovery,
   type BleBus,
   type NodeBleDevice,
 } from "./nodeBle.js"
@@ -30,6 +31,10 @@ export interface ScannerConfig {
   devices: DeviceFilter[]
   /** bluez adapter index (hci0 = 0); shared lock is per-adapter */
   hciDeviceId?: number
+  /** delay between advertisement sweeps during discover(); tests may shorten it */
+  advertisementIntervalMs?: number
+  /** how long a poll waits for BlueZ to expose a device before Device not found */
+  deviceDiscoveryTimeoutMs?: number
 }
 
 export interface DiscoveredDevice {
@@ -231,36 +236,44 @@ export class BleScanner {
     }
 
     await this.withAdapterLock(async () => {
-      const startedHere = await ensureDiscovery(adapter)
-      const inspected = new Set<string>()
+      const intervalMs = this.config.advertisementIntervalMs ?? 750
       try {
-        const deadline = Date.now() + this.config.scanDurationSec * 1000
-        while (Date.now() < deadline) {
-          if (this.foundAllConfiguredViaAdvertisement()) {
-            break
+        await usingDiscovery(adapter, async () => {
+          const deadline = Date.now() + this.config.scanDurationSec * 1000
+          const inspected = new Set<string>()
+          while (Date.now() < deadline) {
+            if (this.foundAllConfiguredViaAdvertisement()) {
+              break
+            }
+            let addresses: string[] = []
+            try {
+              addresses = await adapter.devices()
+            } catch {
+              addresses = []
+            }
+            const fresh = addresses.filter((a) => !inspected.has(normalizeBleAddress(a)))
+            for (const a of fresh) {
+              inspected.add(normalizeBleAddress(a))
+            }
+            // re-check known targets every loop (mfg may appear late)
+            const batch = [
+              ...fresh,
+              ...[...knownTargets].filter((a) => !fresh.some((f) => normalizeBleAddress(f) === a)),
+            ]
+            await mapPool(batch.slice(0, 24), 8, async (address) => {
+              await this.inspectAdvertisement(address)
+            })
+            const remaining = deadline - Date.now()
+            if (remaining <= 0 || this.foundAllConfiguredViaAdvertisement()) {
+              break
+            }
+            await sleep(Math.min(intervalMs, remaining))
           }
-          let addresses: string[] = []
-          try {
-            addresses = await adapter.devices()
-          } catch {
-            addresses = []
-          }
-          const fresh = addresses.filter((a) => !inspected.has(normalizeBleAddress(a)))
-          for (const a of fresh) {
-            inspected.add(normalizeBleAddress(a))
-          }
-          // re-check known targets every loop (mfg may appear late)
-          const batch = [
-            ...fresh,
-            ...[...knownTargets].filter((a) => !fresh.some((f) => normalizeBleAddress(f) === a)),
-          ]
-          await mapPool(batch.slice(0, 24), 8, async (address) => {
-            await this.inspectAdvertisement(address)
-          })
-          await sleep(750)
-        }
+        })
       } finally {
-        await stopDiscoveryIfStarted(adapter, startedHere)
+        // nearby phones and random addresses must not keep a Device1 watch
+        this.releaseUnkeptDevices()
+        await stopOwnedDiscovery(adapter)
       }
     })
 
@@ -297,14 +310,27 @@ export class BleScanner {
   }
 
   private async inspectAdvertisement(address: string): Promise<void> {
-    const addressConfigured = this.matchesConfiguredAddress(address)
-
     let device: NodeBleDevice
     try {
       device = await this.getCachedDevice(address)
     } catch {
       return
     }
+
+    try {
+      await this.inspectAdvertisementDevice(device, address)
+    } finally {
+      if (!this.shouldKeepDeviceHandle(address)) {
+        this.dropBleDevice(address)
+      }
+    }
+  }
+
+  private async inspectAdvertisementDevice(
+    device: NodeBleDevice,
+    address: string,
+  ): Promise<void> {
+    const addressConfigured = this.matchesConfiguredAddress(address)
 
     let mfg: Record<string, unknown> | null = null
     try {
@@ -587,11 +613,9 @@ export class BleScanner {
   private async resolvePendingLocked(addr: string): Promise<void> {
     this.log.debug(`Connecting to resolve serial for ${addr}...`)
     const { adapter } = this.requireBus()
-    // prefer discovery stopped before gatt connect
-    const wasDiscovering = await adapter.isDiscovering()
-    if (wasDiscovering) {
-      try { await adapter.stopDiscovery() } catch { /* ignore */ }
-    }
+    // gatt is more reliable with discovery off. stop our session only;
+    // do not start it again when this attempt finishes.
+    await stopOwnedDiscovery(adapter)
     try {
       const bleDevice = await this.getBleDevice(addr)
       const data = await this.client.updateDevice(bleDevice)
@@ -619,15 +643,9 @@ export class BleScanner {
       }
       throw err
     } finally {
-      if (wasDiscovering) {
-        try {
-          if (!(await adapter.isDiscovering())) {
-            await adapter.startDiscovery()
-          }
-        } catch {
-          // ignore
-        }
-      }
+      // never resume discovery after a connect attempt. a stuck
+      // Discovering=yes between polls is what wedges the adapter.
+      await stopOwnedDiscovery(adapter)
     }
   }
 
@@ -639,16 +657,16 @@ export class BleScanner {
         await cached.getAddress()
         return cached
       } catch {
-        this.bleDevices.delete(key)
-        forgetCachedDevice(this.requireBus().adapter, address)
+        this.dropBleDevice(address)
       }
     }
     const formatted = formatBleAddress(address)
     const { adapter } = this.requireBus()
-    // always run le discovery while waiting — bluez may not have the Device1 node yet
-    const started = await ensureDiscovery(adapter)
-    try {
-      const deadline = Date.now() + 30_000
+    const timeoutMs = this.config.deviceDiscoveryTimeoutMs ?? 30_000
+    // always run le discovery while waiting — bluez may not have the Device1 node yet.
+    // usingDiscovery stops that session on success and on Device not found.
+    return usingDiscovery(adapter, async () => {
+      const deadline = Date.now() + timeoutMs
       let lastErr: unknown
       while (Date.now() < deadline) {
         try {
@@ -657,14 +675,46 @@ export class BleScanner {
           return device
         } catch (err) {
           lastErr = err
-          await sleep(500)
         }
+        const remaining = deadline - Date.now()
+        if (remaining <= 0) break
+        await sleep(Math.min(500, remaining))
       }
       throw lastErr instanceof Error
         ? lastErr
         : new Error(`device ${address} not found during discovery`)
-    } finally {
-      await stopDiscoveryIfStarted(adapter, started)
+    })
+  }
+
+  /** true for devices we will connect to; everyone else is a temporary watch */
+  private shouldKeepDeviceHandle(address: string): boolean {
+    const addr = normalizeBleAddress(address)
+    if (this.pendingAddresses.has(addr)) return true
+    if (this.matchesConfiguredAddress(address)) return true
+    for (const device of this.devices.values()) {
+      if (normalizeBleAddress(device.address) === addr) return true
+    }
+    return false
+  }
+
+  private releaseUnkeptDevices(): void {
+    for (const address of [...this.bleDevices.keys()]) {
+      if (!this.shouldKeepDeviceHandle(address)) {
+        this.dropBleDevice(address)
+      }
+    }
+  }
+
+  /** drop the node-ble Device and the dbus match rules it subscribed */
+  private dropBleDevice(address: string): void {
+    const key = normalizeBleAddress(address)
+    const held = this.bleDevices.get(key)
+    this.bleDevices.delete(key)
+    const forgotten = this.bus
+      ? forgetCachedDevice(this.bus.adapter, address)
+      : undefined
+    if (held && held !== forgotten) {
+      disposeDevice(held)
     }
   }
 
@@ -687,21 +737,15 @@ export class BleScanner {
     try {
       await this.withAdapterLock(async () => {
         if (this.bus) {
-          try {
-            if (await this.bus.adapter.isDiscovering()) {
-              await this.bus.adapter.stopDiscovery()
-            }
-          } catch {
-            // ignore
-          }
-          this.bleDevices.clear()
+          await stopOwnedDiscovery(this.bus.adapter)
+          this.releaseAllDevices()
           this.bus.destroy()
           this.bus = undefined
         }
       }, 5_000)
     } catch (err) {
       this.log.debug(`ble teardown lock skipped: ${String(err)}`)
-      this.bleDevices.clear()
+      this.releaseAllDevices()
       try {
         this.bus?.destroy()
       } catch {
@@ -730,48 +774,35 @@ export class BleScanner {
       `[sync] ${device.displayName} sn=${device.serialNumber}: starting`
       + ` (address=${device.address || "unknown"})`,
     )
+    const { adapter } = this.requireBus()
+    // clear a session we left running. discovery is not resumed after the poll,
+    // including when the device is already cached and getBleDevice does not scan.
+    await stopOwnedDiscovery(adapter)
     try {
-      const { adapter } = this.requireBus()
-      const wasDiscovering = await adapter.isDiscovering()
-      if (wasDiscovering) {
-        try { await adapter.stopDiscovery() } catch { /* ignore */ }
+      const bleDevice = await this.getBleDevice(device.address)
+      const data = await this.client.updateDevice(bleDevice, device.displayName)
+      if (!data.identifier) {
+        data.identifier = device.serialNumber
       }
-      try {
-        const bleDevice = await this.getBleDevice(device.address)
-        const data = await this.client.updateDevice(bleDevice, device.displayName)
-        if (!data.identifier) {
-          data.identifier = device.serialNumber
-        }
-        if (data.name) {
-          device.displayName = device.displayName.startsWith("Airthings ")
-            ? data.name
-            : device.displayName
-        } else {
-          data.name = device.displayName
-        }
-        if (!data.name || data.name === device.serialNumber) {
-          data.name = `Airthings ${productName(data.model)}`
-        }
+      if (data.name) {
+        device.displayName = device.displayName.startsWith("Airthings ")
+          ? data.name
+          : device.displayName
+      } else {
+        data.name = device.displayName
+      }
+      if (!data.name || data.name === device.serialNumber) {
+        data.name = `Airthings ${productName(data.model)}`
+      }
 
-        this.lastData.set(device.id, data)
-        this.onUpdate?.(device.id, data)
-        const ms = Date.now() - started
-        this.log.info(
-          `[sync] ${device.displayName} sn=${device.serialNumber}: ok in ${ms}ms`
-          + ` model=${productName(data.model)} sensors=${JSON.stringify(data.sensors)}`,
-        )
-        return data
-      } finally {
-        if (wasDiscovering) {
-          try {
-            if (!(await adapter.isDiscovering())) {
-              await adapter.startDiscovery()
-            }
-          } catch {
-            // ignore
-          }
-        }
-      }
+      this.lastData.set(device.id, data)
+      this.onUpdate?.(device.id, data)
+      const ms = Date.now() - started
+      this.log.info(
+        `[sync] ${device.displayName} sn=${device.serialNumber}: ok in ${ms}ms`
+        + ` model=${productName(data.model)} sensors=${JSON.stringify(data.sensors)}`,
+      )
+      return data
     } catch (err) {
       const ms = Date.now() - started
       if (err instanceof UnsupportedDeviceError) {
@@ -787,6 +818,14 @@ export class BleScanner {
         + ` — ${String(err)}`,
       )
       throw err
+    } finally {
+      await stopOwnedDiscovery(adapter)
+    }
+  }
+
+  private releaseAllDevices(): void {
+    for (const address of [...this.bleDevices.keys()]) {
+      this.dropBleDevice(address)
     }
   }
 

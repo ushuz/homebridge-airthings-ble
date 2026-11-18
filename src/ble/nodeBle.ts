@@ -4,6 +4,14 @@ import { createRequire } from "node:module"
  * thin wrappers around node-ble (bluez/dbus).
  * linux-only; pure js — no hci socket, so peers can share the adapter.
  *
+ * dbus-next 0.10.2 (node-ble's bus) swaps the arguments to
+ * `hasOwnProperty` in `_addMatch` / `_removeMatch`, so every signal
+ * subscription sends AddMatch and RemoveMatch is never sent. node-ble
+ * also drops its proxy on disconnect (`_ready = false`), so the next
+ * poll builds a new proxy and leaks another match rule. together with
+ * a Device watch per nearby address, that hits
+ * max_match_rules_per_connection and wedges BlueZ discovery.
+ *
  * keep in sync with @ushuz/homebridge-govee-ble `src/ble/nodeBle.ts`
  * (module format differs: this package is esm, govee is cjs).
  */
@@ -89,14 +97,271 @@ const Device = require("node-ble/src/Device") as new (
   device: string,
 ) => NodeBleDevice
 const BusHelper = require("node-ble/src/BusHelper") as {
-  prototype: { children: () => Promise<string[]>, _prepare: () => Promise<void> }
+  prototype: {
+    children: () => Promise<string[]>
+    _prepare: () => Promise<void>
+    removeListeners: () => void
+    waitPropChange: (propName: string) => Promise<unknown>
+  }
   buildChildren: (path: string, nodes: string[]) => string[]
+}
+
+const GattCharacteristic = require("node-ble/src/GattCharacteristic") as {
+  prototype: { stopNotifications: () => Promise<void> }
+}
+
+type MatchBus = {
+  _matchRules?: Record<string, number>
+  _connection?: { stream?: { writable?: boolean } }
+  call: (msg: unknown) => Promise<unknown>
+}
+
+/** in-flight GattServer ServicesResolved waits; cancelled on disconnect */
+const pendingPropWaits = new Set<() => void>()
+
+let blePatchesInstalled = false
+
+/**
+ * install process-wide node-ble / dbus-next fixes. idempotent.
+ * called on import so tests cover the patches without a live bus.
+ */
+export function installBlePatches(): void {
+  if (blePatchesInstalled) return
+  blePatchesInstalled = true
+  patchDbusMatchRefcount()
+  patchBusHelperLifecycle()
+  patchCharacteristicStop()
+  patchGattServerInit()
+}
+
+/** a failed or abandoned gatt init must not keep service/characteristic proxies */
+function patchGattServerInit(): void {
+  const GattServer = require("node-ble/src/GattServer") as {
+    prototype: {
+      init: () => Promise<void>
+      __initPatched?: boolean
+    }
+  }
+  const proto = GattServer.prototype
+  if (proto.__initPatched) return
+  proto.__initPatched = true
+  const origInit = proto.init
+  proto.init = async function initDisposeOnFailure(this: unknown) {
+    try {
+      return await origInit.call(this)
+    } catch (err) {
+      disposeGattServer(this)
+      throw err
+    }
+  }
+}
+
+/**
+ * dbus-next 0.10.2 calls `hasOwnProperty(match, rules)` instead of
+ * `hasOwnProperty(rules, match)`, so the refcount never hits and
+ * RemoveMatch is unreachable. each .on('PropertiesChanged') then
+ * permanently consumes one of the 2048 per-connection match rules.
+ */
+function patchDbusMatchRefcount(): void {
+  const MessageBus = require("dbus-next/lib/bus") as { prototype: MatchBus & {
+    __matchRefcountPatched?: boolean
+    _addMatch: (match: string) => Promise<unknown>
+    _removeMatch: (match: string) => Promise<unknown>
+  } }
+  const { Message } = require("dbus-next") as {
+    Message: new (msg: Record<string, unknown>) => unknown
+  }
+  const proto = MessageBus.prototype
+  if (proto.__matchRefcountPatched) return
+  proto.__matchRefcountPatched = true
+
+  const matchMessage = (member: "AddMatch" | "RemoveMatch", match: string) => new Message({
+    path: "/org/freedesktop/DBus",
+    destination: "org.freedesktop.DBus",
+    interface: "org.freedesktop.DBus",
+    member,
+    signature: "s",
+    body: [match],
+  })
+
+  proto._addMatch = function addMatchRefcounted(this: MatchBus, match: string) {
+    const rules = this._matchRules ?? (this._matchRules = {})
+    if (Object.prototype.hasOwnProperty.call(rules, match)) {
+      rules[match] += 1
+      return Promise.resolve()
+    }
+    rules[match] = 1
+    return this.call(matchMessage("AddMatch", match))
+  }
+
+  proto._removeMatch = function removeMatchRefcounted(this: MatchBus, match: string) {
+    if (!this._connection?.stream?.writable) {
+      return Promise.resolve()
+    }
+    const rules = this._matchRules
+    if (!rules || !Object.prototype.hasOwnProperty.call(rules, match)) {
+      return Promise.resolve()
+    }
+    rules[match] -= 1
+    if (rules[match] > 0) {
+      return Promise.resolve()
+    }
+    delete rules[match]
+    return this.call(matchMessage("RemoveMatch", match))
+  }
+}
+
+/**
+ * keep one proxy and one PropertiesChanged subscription per helper.
+ * node-ble's removeListeners() set `_ready = false` after wiping the
+ * proxy listeners, and the next property read constructed a new
+ * ProxyObject (another AddMatch that was never removed).
+ */
+function patchBusHelperLifecycle(): void {
+  const proto = BusHelper.prototype as {
+    __lifecyclePatched?: boolean
+    _prepare: (this: {
+      _ready?: boolean
+      _objectProxy?: unknown
+      _ifaceProxy?: unknown
+      _propsProxy?: unknown
+      options?: { useProps?: boolean }
+    }) => Promise<void>
+    removeListeners: (this: { removeAllListeners?: (event?: string) => void }) => void
+    waitPropChange: (this: {
+      iface?: string
+      _prepare: () => Promise<void>
+      _propsProxy?: {
+        on: (event: string, cb: (...args: unknown[]) => void) => void
+        off: (event: string, cb: (...args: unknown[]) => void) => void
+      }
+    }, propName: string) => Promise<unknown>
+  }
+  if (proto.__lifecyclePatched) return
+  proto.__lifecyclePatched = true
+
+  const origPrepare = proto._prepare
+  proto._prepare = async function prepareReuseProxy(this: {
+    _ready?: boolean
+    _objectProxy?: unknown
+    _ifaceProxy?: unknown
+    _propsProxy?: unknown
+    options?: { useProps?: boolean }
+  }) {
+    if (this._ready) return
+    if (
+      this._objectProxy
+      && this._ifaceProxy
+      && (!this.options?.useProps || this._propsProxy)
+    ) {
+      this._ready = true
+      return
+    }
+    await origPrepare.call(this)
+  }
+
+  proto.removeListeners = function removeEmitterListenersOnly(this: {
+    removeAllListeners?: (event?: string) => void
+  }) {
+    this.removeAllListeners?.("PropertiesChanged")
+  }
+
+  proto.waitPropChange = async function waitPropChangeCancellable(
+    this: {
+      iface?: string
+      _prepare: () => Promise<void>
+      _propsProxy?: {
+        on: (event: string, cb: (...args: unknown[]) => void) => void
+        off: (event: string, cb: (...args: unknown[]) => void) => void
+      }
+    },
+    propName: string,
+  ) {
+    await this._prepare()
+    return new Promise((resolve, reject) => {
+      let settled = false
+      const cleanup = () => {
+        pendingPropWaits.delete(cancel)
+        try {
+          this._propsProxy?.off("PropertiesChanged", cb)
+        } catch {
+          // ignore
+        }
+      }
+      const cancel = () => {
+        if (settled) return
+        settled = true
+        cleanup()
+        reject(new Error("stopped waiting for property change"))
+      }
+      const cb = (iface: unknown, changedProps: unknown) => {
+        if (settled) return
+        if (!changedProps || typeof changedProps !== "object") return
+        const props = changedProps as Record<string, { value?: unknown }>
+        if (iface !== this.iface || !Object.prototype.hasOwnProperty.call(props, propName)) {
+          return
+        }
+        settled = true
+        cleanup()
+        resolve(props[propName]?.value)
+      }
+      pendingPropWaits.add(cancel)
+      this._propsProxy?.on("PropertiesChanged", cb)
+    })
+  }
+
+  patchBusHelperChildren()
+}
+
+/**
+ * StopNotify can time out while the valuechanged forwarder stays
+ * attached. drop the BusHelper listener even when the dbus call fails.
+ * the proxy subscription itself stays (one match rule per characteristic).
+ */
+function patchCharacteristicStop(): void {
+  const proto = GattCharacteristic.prototype as {
+    __stopPatched?: boolean
+    stopNotifications: (this: {
+      helper?: { callMethod?: (name: string) => Promise<unknown>, removeAllListeners?: (event?: string) => void }
+    }) => Promise<void>
+  }
+  if (proto.__stopPatched) return
+  proto.__stopPatched = true
+  proto.stopNotifications = async function stopNotificationsReleaseListener(this: {
+    helper?: { callMethod?: (name: string) => Promise<unknown>, removeAllListeners?: (event?: string) => void }
+  }) {
+    const clear = () => {
+      try {
+        this.helper?.removeAllListeners?.("PropertiesChanged")
+      } catch {
+        // ignore
+      }
+    }
+    clear()
+    try {
+      await this.helper?.callMethod?.("StopNotify")
+    } finally {
+      clear()
+    }
+  }
+}
+
+/** drop ServicesResolved watches left behind by an abandoned gatt init */
+export function releaseDbusPropertyWaits(): void {
+  for (const cancel of [...pendingPropWaits]) {
+    try {
+      cancel()
+    } catch {
+      // ignore
+    }
+  }
 }
 
 let busHelperPatched = false
 
 /** open dbus connection and bind the configured hciN adapter (no silent fallback) */
 export async function openBleBus(hciDeviceId = 0): Promise<BleBus> {
+  installBlePatches()
   const { bluetooth, destroy } = nodeBle.createBluetooth()
   // node-ble does not handle dbus 'error'; unhandled emitters crash the process
   const dbus = (bluetooth as { dbus?: { on?: (event: string, cb: (err: Error) => void) => void } }).dbus
@@ -119,7 +384,6 @@ export async function openBleBus(hciDeviceId = 0): Promise<BleBus> {
     if (!(await adapter.isPowered())) {
       throw new Error(`bluetooth adapter ${preferred} is not powered`)
     }
-    patchBusHelperChildren()
     patchAdapterDeviceCache(adapter)
     return { adapter, adapterName: preferred, destroy }
   } catch (err) {
@@ -218,7 +482,9 @@ function patchAdapterDeviceCache(adapter: NodeBleAdapter): void {
     const listed = await adapter.devices()
     const onBus = listed.some((address) => formatBleAddress(address) === formatted)
     if (!onBus) {
+      const stale = cache.get(formatted)
       cache.delete(formatted)
+      disposeDevice(stale)
       throw new Error("Device not found")
     }
     const existing = cache.get(formatted)
@@ -232,11 +498,80 @@ function patchAdapterDeviceCache(adapter: NodeBleAdapter): void {
   }
 }
 
-export function forgetCachedDevice(adapter: NodeBleAdapter, address: string): void {
+export function forgetCachedDevice(adapter: NodeBleAdapter, address: string): NodeBleDevice | undefined {
   const cache = (adapter as NodeBleAdapter & {
     __deviceCache?: Map<string, NodeBleDevice>
   }).__deviceCache
-  cache?.delete(formatBleAddress(address))
+  const formatted = formatBleAddress(address)
+  const existing = cache?.get(formatted)
+  cache?.delete(formatted)
+  if (existing) disposeDevice(existing)
+  return existing
+}
+
+interface DisposableHelper {
+  __disposed?: boolean
+  removeAllListeners?: (event?: string) => void
+  _propsProxy?: { removeAllListeners?: (event?: string) => void } | null
+  _ready?: boolean
+  _objectProxy?: unknown
+  _ifaceProxy?: unknown
+}
+
+/** release dbus signal subscriptions held by a node-ble BusHelper */
+export function disposeBusHelper(helper: DisposableHelper | undefined): void {
+  if (!helper || helper.__disposed) return
+  helper.__disposed = true
+  try {
+    helper.removeAllListeners?.("PropertiesChanged")
+  } catch {
+    // ignore
+  }
+  try {
+    helper._propsProxy?.removeAllListeners?.("PropertiesChanged")
+  } catch {
+    // ignore
+  }
+  helper._ready = false
+  helper._objectProxy = null
+  helper._ifaceProxy = null
+  helper._propsProxy = null
+}
+
+/** drop a device and every gatt proxy it opened */
+export function disposeDevice(device: NodeBleDevice | undefined): void {
+  if (!device) return
+  const anyDevice = device as NodeBleDevice & {
+    __disposed?: boolean
+    helper?: DisposableHelper
+    __airthingsGatt?: unknown
+  }
+  if (anyDevice.__disposed) return
+  anyDevice.__disposed = true
+  disposeBusHelper(anyDevice.helper)
+  disposeGattServer(anyDevice.__airthingsGatt)
+  anyDevice.__airthingsGatt = undefined
+}
+
+function disposeGattServer(gatt: unknown): void {
+  if (!gatt || typeof gatt !== "object") return
+  const server = gatt as {
+    __disposed?: boolean
+    helper?: DisposableHelper
+    _services?: Record<string, {
+      helper?: DisposableHelper
+      _characteristics?: Record<string, { helper?: DisposableHelper }>
+    }>
+  }
+  if (server.__disposed) return
+  server.__disposed = true
+  disposeBusHelper(server.helper)
+  for (const service of Object.values(server._services ?? {})) {
+    disposeBusHelper(service?.helper)
+    for (const characteristic of Object.values(service?._characteristics ?? {})) {
+      disposeBusHelper(characteristic?.helper)
+    }
+  }
 }
 
 export function isMissingBluezInterface(error: unknown): boolean {
@@ -248,6 +583,7 @@ export function isMissingBluezInterface(error: unknown): boolean {
 function hardenDevice(device: NodeBleDevice): NodeBleDevice {
   const anyDevice = device as NodeBleDevice & {
     __hardened?: boolean
+    __airthingsGatt?: NodeBleGattServer
     helper?: { removeListeners?: () => void }
     gatt?: () => Promise<NodeBleGattServer>
   }
@@ -265,6 +601,10 @@ function hardenDevice(device: NodeBleDevice): NodeBleDevice {
     await origConnect()
   }
   device.disconnect = async () => {
+    // cancel a GattServer.init stuck on ServicesResolved before the
+    // dbus Disconnect, and keep the device proxy (removeListeners no
+    // longer rebuilds it).
+    releaseDbusPropertyWaits()
     try {
       await origDisconnect()
     } finally {
@@ -283,13 +623,18 @@ function hardenDevice(device: NodeBleDevice): NodeBleDevice {
       try {
         const services = await gattCached.services()
         if (services.length > 0) {
+          anyDevice.__airthingsGatt = gattCached
           return gattCached
         }
       } catch {
-        gattCached = undefined
+        // remap below
       }
+      disposeGattServer(gattCached)
+      gattCached = undefined
+      anyDevice.__airthingsGatt = undefined
     }
     gattCached = await origGatt()
+    anyDevice.__airthingsGatt = gattCached
     return gattCached
   }
 
@@ -370,19 +715,20 @@ function sleep(ms: number): Promise<void> {
  * works if we own the session), then start; on "already in progress" piggyback.
  * if start still fails, power-cycle the adapter to clear a stuck session.
  * returns whether this call started discovery (caller should stop only if true).
+ * a thrown error does not leave a session this client started.
  */
 export async function ensureDiscovery(adapter: NodeBleAdapter): Promise<boolean> {
+  let stopped = false
   try {
     if (await adapter.isDiscovering()) {
-      try {
-        await adapter.stopDiscovery()
-        await sleep(150)
-      } catch {
-        // another client owns the session — piggyback below
-      }
+      await adapter.stopDiscovery()
+      stopped = true
     }
   } catch {
-    // ignore property read errors
+    // another client owns the session, or the property read failed
+  }
+  if (stopped) {
+    await sleep(150)
   }
 
   if (await adapter.isDiscovering().catch(() => false)) {
@@ -403,8 +749,45 @@ export async function ensureDiscovery(adapter: NodeBleAdapter): Promise<boolean>
       await powerCycleAdapter(adapter)
       await adapter.startDiscovery()
       return true
-    } catch {
-      throw err
+    } catch (startErr) {
+      await stopOwnedDiscovery(adapter)
+      throw startErr instanceof Error ? startErr : err
+    }
+  }
+}
+
+/**
+ * stop discovery if this dbus client owns the session.
+ * BlueZ StopDiscovery only cancels the caller, so another plugin's scan
+ * is left running. errors (not discovering, not our session) are ignored.
+ */
+export async function stopOwnedDiscovery(adapter: NodeBleAdapter): Promise<void> {
+  try {
+    if (await adapter.isDiscovering()) {
+      await adapter.stopDiscovery()
+    }
+  } catch {
+    // ignore
+  }
+}
+
+/**
+ * run `fn` while discovery is active, then always stop a session we started.
+ * discovery is not left on for the next poll, including when `fn` throws
+ * (Device not found, timeout).
+ */
+export async function usingDiscovery<T>(
+  adapter: NodeBleAdapter,
+  fn: () => Promise<T>,
+): Promise<T> {
+  let startedHere = false
+  try {
+    startedHere = await ensureDiscovery(adapter)
+    return await fn()
+  } finally {
+    await stopDiscoveryIfStarted(adapter, startedHere)
+    if (startedHere) {
+      await stopOwnedDiscovery(adapter)
     }
   }
 }
@@ -468,6 +851,8 @@ export async function mapAllCharacteristics(
   }
   return byUuid
 }
+
+installBlePatches()
 
 export function uuidKey(uuid: string): string {
   const compact = uuid.replace(/-/g, "").toLowerCase()
